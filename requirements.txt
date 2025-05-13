@@ -1,0 +1,42 @@
+# ---------- Core Deep Learning ----------
+
+torch>=2.2.2
+torchvision>=0.17.2
+timm>=0.9.16
+
+# ---------- Hugging Face stack ----------
+
+transformers>=4.40.1
+datasets>=2.19.1
+tokenizers>=0.19.1
+accelerate>=0.27.2
+evaluate>=0.4.1
+
+# ---------- Interpretability ----------
+
+transformerlens==1.16.0
+captum>=0.7.0
+
+# ---------- Meta‑model / ML utils ----------
+
+scikit-learn>=1.4.2
+numpy>=1.26.4
+pandas>=2.2.2
+tqdm>=4.66.2
+matplotlib>=3.9.0
+rich>=13.7.0
+pyyaml>=6.0.1
+
+# ---------- Seq‑to‑seq eval ----------
+
+sacrebleu>=2.4.0
+sentencepiece>=0.2.0
+
+# ---------- Experiment tracking ----------
+
+wandb>=0.17.0
+
+# ---------- Jupyter / Dev ----------
+
+jupyterlab>=4.1.5
+ipykernel>=6.29.3

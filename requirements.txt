@@ -14,7 +14,8 @@ evaluate>=0.4.1
 
 # ---------- Interpretability ----------
 
-transformerlens==1.16.0
+transformer-lens>=2.1.0
+
 captum>=0.7.0
 
 # ---------- Meta‑model / ML utils ----------

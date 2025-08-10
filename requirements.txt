@@ -1,48 +1,28 @@
-# ---------- Core Deep Learning ----------
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==16.1.0
+datasets==2.19.1
+requests==2.32.3
+conllu==4.5.3
+tqdm==4.66.4
 
 torch>=2.2.2
-torchvision>=0.17.2
-timm>=0.9.16
-
-# ---------- Hugging Face stack ----------
-
 transformers>=4.40.1
-datasets>=2.19.1
 tokenizers>=0.19.1
 accelerate>=0.27.2
+scikit-learn>=1.4.2
 evaluate>=0.4.1
 
-# ---------- Interpretability ----------
+einops>=0.7.0
+zarr>=2.17.0
+numcodecs>=0.12.1
+zstandard>=0.22.0
 
-transformer-lens>=2.1.0
-
-captum>=0.7.0
-
-# ---------- Meta‑model / ML utils ----------
-
-scikit-learn>=1.4.2
-numpy>=1.26.4
-pandas>=2.2.2
-tqdm>=4.66.2
 matplotlib>=3.9.0
 rich>=13.7.0
 pyyaml>=6.0.1
 
-# ---------- Seq‑to‑seq eval ----------
-
-sacrebleu>=2.4.0
-sentencepiece>=0.2.0
-
-# ---------- Experiment tracking ----------
-
-wandb>=0.17.0
-
-# ---------- Jupyter / Dev ----------
-
 jupyterlab>=4.1.5
 ipykernel>=6.29.3
 
-
-# ---------- Visualization -----------
-
-matplotlib
+zarr

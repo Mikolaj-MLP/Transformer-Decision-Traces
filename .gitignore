@@ -1,0 +1,71 @@
+# Python / build
+__pycache__/
+*.py[cod]
+*.so
+.build/
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Virtual envs / local config
+.venv/
+venv/
+env/
+ENV/
+.conda/
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.env
+.env.*
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+.jupyter/
+
+# Testing / lint
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage*
+coverage.xml
+htmlcov/
+
+# Hugging Face / caches (repo-local)
+.huggingface/
+.cache/
+
+# Project data & artifacts (generated)
+data/
+!data/.gitkeep
+
+models/hf_cache/
+models/checkpoints/
+
+traces/
+!traces/.gitkeep
+
+experiments/runs/
+!experiments/.gitkeep
+
+results/
+!results/.gitkeep
+
+logs/
+wandb/
+mlruns/
+outputs/
+
+# Common ML 
+*.pt
+*.bin
+*.ckpt
+*.onnx
+*.zarr
+*.npz
+*.npy

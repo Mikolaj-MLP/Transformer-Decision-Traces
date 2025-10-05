@@ -11,7 +11,7 @@ def main():
 
     store = TraceStore(args.run_dir)
     idx = store.build_index(persist=True)
-    print(f"[index] {len(idx)} example_ids → row indices → {store.index_path}")
+    print(f"[index] {len(idx)} example_ids, row indices :  {store.index_path}")
 
     if args.validate:
         print("[meta]", store.meta)

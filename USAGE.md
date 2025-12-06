@@ -19,8 +19,6 @@ Outputs are chunked **Zarr** arrays with a **tokens.parquet** and **meta.json** 
 ## Quick start
 
 ```powershell
-# (Optional) activate your venv
-# .\venvs\Masters_env\Scripts\activate
 
 # 1) Prepare datasets (UD English-EWT, GoEmotions)
 python -m src.data.prepare_datasets

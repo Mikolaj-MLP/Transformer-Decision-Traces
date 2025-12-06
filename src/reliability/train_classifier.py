@@ -12,7 +12,7 @@ from transformers import (
     Trainer,
 )
 
-# --------- Data helpers (binary valence from GoEmotions) ----------
+#  Data helpers (binary valence from GoEmotions
 def _map_valence(label_names):
     POS = {"admiration","amusement","approval","caring","desire","excitement",
            "gratitude","joy","love","optimism","pride","relief"}
@@ -72,20 +72,20 @@ def main():
     ap.add_argument("--batch_size",  default=16, type=int)
     args = ap.parse_args()
 
-    # 1) Make CSV splits (binary valence)
+    # CSV splits (binary valence)
     csv_dir = _make_split_csvs(args.processed_go, args.data_dir)
     train_csv = csv_dir / "goemotions_valence_train.csv"
     val_csv   = csv_dir / "goemotions_valence_validation.csv"
     test_csv  = csv_dir / "goemotions_valence_test.csv"
 
-    # 2) Tokenizer & datasets
+    # Tokenizer & datasets
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     dsd = _build_hf_dataset(train_csv, val_csv, test_csv, tok)
 
-    # 3) Model
+    # Model
     model = AutoModelForSequenceClassification.from_pretrained(args.model, num_labels=2)
 
-    # 4) TrainingArguments with version-compat fallback
+    # TrainingArguments with version-compat fallback
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     base_kwargs = dict(
         output_dir=str(out_dir / "hf"),
@@ -127,7 +127,7 @@ def main():
 
     trainer.train()
 
-    # 5) Predictions on validation split → probabilities, errors
+    # Predictions on validation split -> probabilities, errors
     val_raw = trainer.predict(dsd["validation"])
     val_df = pd.read_csv(val_csv)
 

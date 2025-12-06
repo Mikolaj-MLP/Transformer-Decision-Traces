@@ -7,7 +7,6 @@ from sklearn.decomposition import PCA
 
 from src.traces.store import TraceStore
 
-# --- helpers (arch-aware) ---
 
 def attn_entropy(A, eps=1e-12):
     rs = A.sum(-1, keepdims=True)
@@ -61,7 +60,7 @@ def per_example_features(st: TraceStore, eid: str, take_pca=8):
     mask = seq_mask(enc, arch, side=side_for_self)
     idx = np.flatnonzero(mask)
 
-    # Effective L,H from meta (falls back to shapes if needed)
+    # Effective L,H from meta (falls back to shapes !!!!!!!1!)
     L = st.meta.get("num_layers")
     H = st.meta.get("num_heads")
     if L is None or H is None:
@@ -143,7 +142,7 @@ def main():
     pred = pred.set_index("example_id")
 
     rows = []
-    # optional: fit PCA on a subset globally (simple approach: fit per example on its stacks; adequate for first pass)
+    # optional: fit PCA on a subset globally
     for eid in st.tokens["example_id"]:
         feats = per_example_features(st, eid, take_pca=args.take_pca)
         feats["example_id"] = eid

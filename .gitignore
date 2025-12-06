@@ -69,3 +69,10 @@ outputs/
 *.zarr
 *.npz
 *.npy
+*.json
+*.csv
+*.parquet
+*.txt
+*.safetensors
+*.joblib
+*.pth

@@ -97,6 +97,113 @@ class QKVHooks:
         for h in self.handles: h.remove()
         self.handles.clear()
 
+class ResidualHooks:
+    """
+    Capture residual stream checkpoints:
+      - embed: output of embeddings (B,T,d)
+      - pre_attn[L]: input to block L (B,T,d)
+      - post_attn[L]: after attention sublayer + residual/ln (B,T,d)
+      - post_mlp[L]: block output (B,T,d)
+    Supports:
+      - RoBERTa: encoder blocks at model.encoder.layer
+      - GPT-2:   decoder blocks at model.h
+    """
+    def __init__(self, model: nn.Module, arch: str):
+        self.model = model
+        self.arch = arch  # "enc" | "dec" | "encdec"
+        self.embed = None
+        self.pre = {}
+        self.pattn = {}
+        self.post = {}
+        self._hooks = []
+        self._attach()
+
+    def clear(self):
+        self.embed = None
+        self.pre.clear(); self.pattn.clear(); self.post.clear()
+
+    def remove(self):
+        for h in self._hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self._hooks.clear()
+
+    # ---- internals ----
+    def _attach(self):
+        # Embeddings
+        emb_mod = getattr(self.model, "embeddings", None) or getattr(self.model, "wte", None)
+        if emb_mod is not None:
+            self._hooks.append(emb_mod.register_forward_hook(self._hook_embed))
+
+        # Blocks: RoBERTa encoder blocks at encoder.layer; GPT-2 blocks at h
+        if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layer"):
+            layers = list(self.model.encoder.layer)
+            for li, layer in enumerate(layers):
+                # pre-attn = input to block
+                self._hooks.append(layer.register_forward_pre_hook(self._make_pre_hook(li)))
+                # post-mlp = layer output
+                self._hooks.append(layer.register_forward_hook(self._make_post_hook(li)))
+                # post-attn: hook attention.output if present
+                attn_out = getattr(getattr(layer, "attention", None), "output", None)
+                if attn_out is not None:
+                    self._hooks.append(attn_out.register_forward_hook(self._make_pattn_hook(li)))
+        elif hasattr(self.model, "h"):  # GPT-2
+            layers = list(self.model.h)
+            for li, block in enumerate(layers):
+                # block input
+                self._hooks.append(block.register_forward_pre_hook(self._make_pre_hook(li)))
+                # block output
+                self._hooks.append(block.register_forward_hook(self._make_post_hook(li)))
+                # post-attn: approximate via hooking attn and adding residual inside hook
+                attn_mod = getattr(block, "attn", None)
+                if attn_mod is not None:
+                    self._hooks.append(attn_mod.register_forward_hook(self._make_gpt2_pattn_hook(li)))
+
+    # ---- hook fns ----
+    def _hook_embed(self, mod, inp, out):
+        self.embed = out.detach()
+
+    def _make_pre_hook(self, li: int):
+        def _pre(mod, inp):
+            x = inp[0]
+            self.pre[li] = x.detach()
+        return _pre
+
+    def _make_post_hook(self, li: int):
+        def _post(mod, inp, out):
+            self.post[li] = out.detach()
+        return _post
+
+    def _make_pattn_hook(self, li: int):
+        # For RoBERTa: attention.output returns LN(x + attn_out)
+        def _pattn(mod, inp, out):
+            self.pattn[li] = out.detach()
+        return _pattn
+
+    def _make_gpt2_pattn_hook(self, li: int):
+        # For GPT-2 (pre-LN): approximate post-attn as (pre_attn + attn_out)
+        def _gpt(mod, inp, out):
+            x_pre = self.pre.get(li, None)
+            if x_pre is not None:
+                try:
+                    self.pattn[li] = (x_pre + out).detach()
+                except Exception:
+                    self.pattn[li] = out.detach()
+            else:
+                self.pattn[li] = out.detach()
+        return _gpt
+
+    def pop_embed(self):
+        x = self.embed
+        self.embed = None
+        return x
+
+    def pop_layers(self):
+        pre, pattn, post = self.pre, self.pattn, self.post
+        self.pre = {}; self.pattn = {}; self.post = {}
+        return pre, pattn, post
 
 # Decoder-only (GPT-2)
 

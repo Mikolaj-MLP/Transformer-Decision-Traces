@@ -10,7 +10,7 @@ from transformers import AutoConfig
 
 from src.data.load_text import load_ud_ewt, load_go_emotions
 from src.models.load import load_base
-from src.models.hooks import QKVHooks, GPT2QKVHooks, T5QKVHooks, MLPHooks
+from src.models.hooks import QKVHooks, GPT2QKVHooks, T5QKVHooks, MLPHooks, ResidualHooks
 from src.utils.zarrio import create_array
 import zarr
 
@@ -61,7 +61,12 @@ def main():
     ap.add_argument("--max_seq_len", type=int, default=128)
     ap.add_argument("--dec_max_len", type=int, default=64, help="decoder seq length when targets are provided")
     ap.add_argument("--batch_size", type=int, default=8)
-    ap.add_argument("--capture", nargs="+", default=["attn", "qkv"], choices=["attn", "qkv", "mlp", "hidden"])
+    ap.add_argument(
+        "--capture",
+        nargs="+",
+        default=["attn", "qkv"],
+        choices=["attn", "qkv", "mlp", "hidden", "resid"],  # <--- added 'resid'
+    )
     ap.add_argument("--dtype", type=str, default="float16", choices=["float16", "float32"])
 
     # NEW: fine-grained selectors (side-specific)
@@ -109,7 +114,7 @@ def main():
         return_offsets_mapping=True,
     )
 
-    # Decoder inputs for enc-dec (optional)
+    # Decoder inputs for enc-dec 
     dec = None
     if arch == "encdec" and args.targets_file and os.path.exists(args.targets_file):
         with open(args.targets_file, "r", encoding="utf-8") as f:
@@ -125,33 +130,37 @@ def main():
             return_offsets_mapping=True,
         )
 
-    # Shapes & dims per arch
+    # Shapes and dims per arch
     if arch == "enc":
         L_enc = int(cfg.num_hidden_layers)
         H_enc = int(cfg.num_attention_heads)
         T_enc = int(args.max_seq_len)
         d_head_enc = int(cfg.hidden_size) // H_enc
-        L_dec = H_dec = T_dec = d_head_dec = 0
+        D_enc = int(cfg.hidden_size)
+        L_dec = H_dec = T_dec = d_head_dec = D_dec = 0
     elif arch == "dec":
         try:
             L_dec = int(getattr(cfg, "n_layer", cfg.num_hidden_layers))
             H_dec = int(getattr(cfg, "n_head", cfg.num_attention_heads))
             d_head_dec = int(getattr(cfg, "n_embd", cfg.hidden_size)) // H_dec
+            D_dec = int(getattr(cfg, "n_embd", cfg.hidden_size))
         except Exception:
-            L_dec = int(cfg.num_hidden_layers); H_dec = int(cfg.num_attention_heads); d_head_dec = int(cfg.hidden_size)//H_dec
+            L_dec = int(cfg.num_hidden_layers); H_dec = int(cfg.num_attention_heads)
+            D_dec = int(cfg.hidden_size); d_head_dec = D_dec // H_dec
         T_dec = int(args.max_seq_len)
-        L_enc = H_enc = T_enc = d_head_enc = 0
-    else:  # encdec
+        L_enc = H_enc = T_enc = d_head_enc = D_enc = 0
+    else:  # encdec (e.g., T5)
         L_enc = int(getattr(cfg, "num_layers", getattr(cfg, "num_encoder_layers", 12)))
         L_dec = int(getattr(cfg, "num_decoder_layers", L_enc))
         H_enc = H_dec = int(getattr(cfg, "num_heads", 12))
         d_model = int(getattr(cfg, "d_model", 512))
         d_head_enc = d_model // H_enc
         d_head_dec = d_head_enc
+        D_enc = D_dec = d_model
         T_enc = int(args.max_seq_len)
         T_dec = int(args.dec_max_len)
 
-    # Choose per-side indices (fall back to global, then default all) and validate
+    #per-side indices (fall back to global, then default all) and validate
     _raw_layers_enc = parse_index_list(args.layers_enc or args.layers)
     _raw_heads_enc  = parse_index_list(args.heads_enc  or args.heads)
     _raw_layers_dec = parse_index_list(args.layers_dec or args.layers)
@@ -266,24 +275,88 @@ def main():
     enc_hidden_arr = dec_hidden_arr = None
     if "hidden" in args.capture:
         if arch == "enc":
-            D = int(cfg.hidden_size)
             enc_hidden_arr = create_array(p("hidden.zarr"), "h",
-                                          shape=(len(texts), L_enc + 1, T_enc, D),
-                                          chunks=(1, 1, T_enc, D), dtype=dtype)
+                                          shape=(len(texts), L_enc + 1, T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
         elif arch == "dec":
-            D = int(getattr(cfg, "n_embd", cfg.hidden_size))
             dec_hidden_arr = create_array(p("dec_hidden.zarr"), "h",
-                                          shape=(len(texts), L_dec + 1, T_dec, D),
-                                          chunks=(1, 1, T_dec, D), dtype=dtype)
+                                          shape=(len(texts), L_dec + 1, T_dec, D_dec),
+                                          chunks=(1, 1, T_dec, D_dec), dtype=dtype)
         else:
-            D = int(getattr(cfg, "d_model", 512))
             enc_hidden_arr = create_array(p("enc_hidden.zarr"), "h",
-                                          shape=(len(texts), L_enc + 1, T_enc, D),
-                                          chunks=(1, 1, T_enc, D), dtype=dtype)
+                                          shape=(len(texts), L_enc + 1, T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
             if dec is not None:
                 dec_hidden_arr = create_array(p("dec_hidden.zarr"), "h",
-                                              shape=(len(texts), L_dec + 1, T_dec, D),
-                                              chunks=(1, 1, T_dec, D), dtype=dtype)
+                                              shape=(len(texts), L_dec + 1, T_dec, D_dec),
+                                              chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+
+    # Residual streams (optional)
+    # Encoder-only: res_embed / res_pre_attn / res_post_attn / res_post_mlp
+    # Decoder-only: dec_res_*
+    # Enc-Dec:      enc_res_* and dec_res_*
+    res_enc_embed = res_enc_pre = res_enc_pattn = res_enc_post = None
+    res_dec_embed = res_dec_pre = res_dec_pattn = res_dec_post = None
+    if "resid" in args.capture:
+        if arch == "enc":
+            res_enc_embed  = create_array(p("res_embed.zarr"), "x",
+                                          shape=(len(texts), T_enc, D_enc), chunks=(1, T_enc, D_enc), dtype=dtype)
+            res_enc_pre    = create_array(p("res_pre_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+            res_enc_pattn  = create_array(p("res_post_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+            res_enc_post   = create_array(p("res_post_mlp.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+        elif arch == "dec":
+            res_dec_embed  = create_array(p("dec_res_embed.zarr"), "x",
+                                          shape=(len(texts), T_dec, D_dec), chunks=(1, T_dec, D_dec), dtype=dtype)
+            res_dec_pre    = create_array(p("dec_res_pre_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                          chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+            res_dec_pattn  = create_array(p("dec_res_post_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                          chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+            res_dec_post   = create_array(p("dec_res_post_mlp.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                          chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+        else:
+            res_enc_embed  = create_array(p("enc_res_embed.zarr"), "x",
+                                          shape=(len(texts), T_enc, D_enc), chunks=(1, T_enc, D_enc), dtype=dtype)
+            res_enc_pre    = create_array(p("enc_res_pre_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+            res_enc_pattn  = create_array(p("enc_res_post_attn.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+            res_enc_post   = create_array(p("enc_res_post_mlp.zarr"), "x",
+                                          shape=(len(texts), len(layer_idx_enc), T_enc, D_enc),
+                                          chunks=(1, 1, T_enc, D_enc), dtype=dtype)
+            if dec is not None:
+                res_dec_embed  = create_array(p("dec_res_embed.zarr"), "x",
+                                              shape=(len(texts), T_dec, D_dec), chunks=(1, T_dec, D_dec), dtype=dtype)
+                res_dec_pre    = create_array(p("dec_res_pre_attn.zarr"), "x",
+                                              shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                              chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+                res_dec_pattn  = create_array(p("dec_res_post_attn.zarr"), "x",
+                                              shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                              chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+                res_dec_post   = create_array(p("dec_res_post_mlp.zarr"), "x",
+                                              shape=(len(texts), len(layer_idx_dec), T_dec, D_dec),
+                                              chunks=(1, 1, T_dec, D_dec), dtype=dtype)
+
+    # Hooks
+    qkv_enc = qkv_dec = qkv_t5 = None
+    if "qkv" in args.capture:
+        if arch == "enc":
+            qkv_enc = QKVHooks(model) if L_enc else None
+        elif arch == "dec":
+            qkv_dec = GPT2QKVHooks(model) if L_dec else None
+        else:
+            qkv_t5  = T5QKVHooks(model)
+    resid_hooks = ResidualHooks(model, arch) if "resid" in args.capture else None
 
     # Iterate
     N = len(texts)
@@ -310,7 +383,6 @@ def main():
                     batch["decoder_input_ids"] = d_ids
                     batch["decoder_attention_mask"] = torch.ones_like(d_ids)
 
-
             # clear hooks
             if qkv_enc: qkv_enc.clear()
             if qkv_dec: qkv_dec.clear()
@@ -322,7 +394,6 @@ def main():
                 output_hidden_states=("hidden" in args.capture),
                 return_dict=True,
             )
-            # forward
 
             # attentions
             if "attn" in args.capture:
@@ -396,6 +467,103 @@ def main():
                         Hsd = torch.stack([h.detach().cpu() for h in out.decoder_hidden_states], dim=1)
                         dec_hidden_arr[sl] = Hsd.numpy().astype(np.float16 if dtype == "f2" else np.float32)
 
+            # Residual stream checkpoints
+            if "resid" in args.capture and resid_hooks is not None:
+                emb = resid_hooks.pop_embed()
+                pre, pattn, post = resid_hooks.pop_layers()  # dicts: layer_id -> (B,T,D)
+
+                if arch == "enc":
+                    if emb is not None and res_enc_embed is not None:
+                        res_enc_embed[sl] = emb.detach().cpu().numpy().astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_pre is not None:
+                        pre_list = [pre.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in pre_list):
+                            pre_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pre_list]
+                            X = torch.stack(pre_list, dim=1).detach().cpu().numpy()
+                            res_enc_pre[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_pattn is not None:
+                        pa_list = [pattn.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in pa_list):
+                            pa_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pa_list]
+                            X = torch.stack(pa_list, dim=1).detach().cpu().numpy()
+                            res_enc_pattn[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_post is not None:
+                        po_list = [post.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in po_list):
+                            po_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in po_list]
+                            X = torch.stack(po_list, dim=1).detach().cpu().numpy()
+                            res_enc_post[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+
+                elif arch == "dec":
+                    if emb is not None and res_dec_embed is not None:
+                        res_dec_embed[sl] = emb.detach().cpu().numpy().astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_dec_pre is not None:
+                        pre_list = [pre.get(li, None) for li in layer_idx_dec]
+                        if any(x is not None for x in pre_list):
+                            pre_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pre_list]
+                            X = torch.stack(pre_list, dim=1).detach().cpu().numpy()
+                            res_dec_pre[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_dec_pattn is not None:
+                        pa_list = [pattn.get(li, None) for li in layer_idx_dec]
+                        if any(x is not None for x in pa_list):
+                            pa_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pa_list]
+                            X = torch.stack(pa_list, dim=1).detach().cpu().numpy()
+                            res_dec_pattn[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_dec_post is not None:
+                        po_list = [post.get(li, None) for li in layer_idx_dec]
+                        if any(x is not None for x in po_list):
+                            po_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in po_list]
+                            X = torch.stack(po_list, dim=1).detach().cpu().numpy()
+                            res_dec_post[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+
+                else:  # encdec
+                    # Encoder side
+                    if res_enc_embed is not None and emb is not None:
+                        # For encdec, ResidualHooks.embed is the encoder embedding output (only run encoder once per forward)
+                        res_enc_embed[sl] = emb.detach().cpu().numpy().astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_pre is not None:
+                        pre_list = [pre.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in pre_list):
+                            pre_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pre_list]
+                            X = torch.stack(pre_list, dim=1).detach().cpu().numpy()
+                            res_enc_pre[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_pattn is not None:
+                        pa_list = [pattn.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in pa_list):
+                            pa_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in pa_list]
+                            X = torch.stack(pa_list, dim=1).detach().cpu().numpy()
+                            res_enc_pattn[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                    if res_enc_post is not None:
+                        po_list = [post.get(li, None) for li in layer_idx_enc]
+                        if any(x is not None for x in po_list):
+                            po_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_enc, D_enc), device=device, dtype=emb.dtype if emb is not None else out.last_hidden_state.dtype) for x in po_list]
+                            X = torch.stack(po_list, dim=1).detach().cpu().numpy()
+                            res_enc_post[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+
+                    # Decoder side 
+                    if dec is not None:
+                        if res_dec_embed is not None and emb is not None:
+                            # Note: many enc-dec impls don't expose decoder "embed" via the same hook; ResidualHooks approximates it if available.
+                            pass  
+                        if res_dec_pre is not None:
+                            pre_list = [pre.get(li, None) for li in layer_idx_dec]
+                            if any(x is not None for x in pre_list):
+                                pre_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=out.last_hidden_state.dtype) for x in pre_list]
+                                X = torch.stack(pre_list, dim=1).detach().cpu().numpy()
+                                res_dec_pre[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                        if res_dec_pattn is not None:
+                            pa_list = [pattn.get(li, None) for li in layer_idx_dec]
+                            if any(x is not None for x in pa_list):
+                                pa_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=out.last_hidden_state.dtype) for x in pa_list]
+                                X = torch.stack(pa_list, dim=1).detach().cpu().numpy()
+                                res_dec_pattn[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+                        if res_dec_post is not None:
+                            po_list = [post.get(li, None) for li in layer_idx_dec]
+                            if any(x is not None for x in po_list):
+                                po_list = [x if x is not None else torch.zeros((sl.stop-sl.start, T_dec, D_dec), device=device, dtype=out.last_hidden_state.dtype) for x in po_list]
+                                X = torch.stack(po_list, dim=1).detach().cpu().numpy()
+                                res_dec_post[sl] = X.astype(np.float16 if dtype == "f2" else np.float32)
+
     # Save tokens + meta under tmp_root
     df_tok = pd.DataFrame({
         "example_id": texts["example_id"],
@@ -423,7 +591,6 @@ def main():
         "num_layers": int(getattr(cfg, "num_hidden_layers", getattr(cfg, "num_layers", getattr(cfg, "n_layer", 12)))),
         "num_heads": int(getattr(cfg, "num_attention_heads", getattr(cfg, "num_heads", getattr(cfg, "n_head", 12)))),
         "head_dim": int(getattr(cfg, "hidden_size", getattr(cfg, "d_model", getattr(cfg, "n_embd", 768)))) // int(getattr(cfg, "num_attention_heads", getattr(cfg, "num_heads", getattr(cfg, "n_head", 12)))),
- 
         "layers_stored": {"enc": layer_idx_enc, "dec": layer_idx_dec} if arch in ("encdec", "dec") else layer_idx_enc,
         "heads_stored": {"enc": head_idx_enc, "dec": head_idx_dec} if arch in ("encdec", "dec") else head_idx_enc,
         "dtype": args.dtype,
@@ -434,7 +601,6 @@ def main():
     with (tmp_root / "meta.json").open("w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    # ATOMIC MOVE ! 
     if final_root.exists():
         shutil.rmtree(final_root)
     shutil.move(tmp_root.as_posix(), final_root.as_posix())

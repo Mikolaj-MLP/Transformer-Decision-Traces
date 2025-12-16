@@ -42,7 +42,7 @@ def main():
     X, mu, sd = standardize(X)
     torch.save({"mu":mu, "sd":sd, "feat_cols":feat_cols}, out_dir/"scaler.pt")
 
-    # simple split (last 20% for calibration)
+    # split (last 20% for calibration)
     n = len(X); n_cal = max(64, int(0.2*n))
     X_tr, X_cal = X[:-n_cal], X[-n_cal:]
     y_tr, y_cal = y[:-n_cal], y[-n_cal:]
@@ -82,7 +82,7 @@ def main():
             logits_cal.append(logit.detach().cpu().numpy())
         logits_cal = np.concatenate(logits_cal, 0)
 
-    # Platt scaling → calibrated p(error)
+    # Platt scaling -> calibrated p(error)
     lr = LogisticRegression(max_iter=1000)
     lr.fit(logits_cal.reshape(-1,1), y_cal)
     torch.save({"state_dict": model.state_dict(),
@@ -97,7 +97,7 @@ def main():
     print("AUPRC:", average_precision_score(y_cal, p_err))
     print("Brier:", brier_score_loss(y_cal, p_err))
 
-    # Choose operating threshold (Youden J)
+    # operating threshold 
     from sklearn.metrics import roc_curve
     fpr,tpr,thr = roc_curve(y_cal, p_err)
     j = tpr - fpr; best = int(np.argmax(j))

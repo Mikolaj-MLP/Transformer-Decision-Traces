@@ -1,3 +1,4 @@
+# src/cli/index_traces.py
 from __future__ import annotations
 import argparse, json, os
 from pathlib import Path

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 
-#  Encoder-only (BERT/RoBERTa) 
+#  Encoder-only (BERT/RoBERTa)
 
 def _has_proj(m: nn.Module, kind: str) -> bool:
     if kind == "q":
@@ -37,7 +37,7 @@ def _num_heads_and_dim(m: nn.Module, q: torch.Tensor) -> Tuple[int, int]:
     raise AttributeError("Cannot infer num_attention_heads/attention_head_size")
 
 def _to_heads(x: torch.Tensor, H: int, d: int) -> torch.Tensor:
-    # (B, T, H*d) -> (B, H, T, d)
+    # (B, T, H*d) --> (B, H, T, d)
     B, T, _ = x.shape
     return x.view(B, T, H, d).permute(0, 2, 1, 3).contiguous()
 
@@ -97,6 +97,7 @@ class QKVHooks:
         for h in self.handles: h.remove()
         self.handles.clear()
 
+
 class ResidualHooks:
     """
     Capture residual stream checkpoints:
@@ -106,7 +107,7 @@ class ResidualHooks:
       - post_mlp[L]: block output (B,T,d)
     Supports:
       - RoBERTa: encoder blocks at model.encoder.layer
-      - GPT-2:   decoder blocks at model.h
+      - GPT-2:   decoder blocks at model.h OR model.transformer.h (GPT2LMHeadModel)
     """
     def __init__(self, model: nn.Module, arch: str):
         self.model = model
@@ -130,14 +131,16 @@ class ResidualHooks:
                 pass
         self._hooks.clear()
 
-    # ---- internals ----
+    # ---- internals
     def _attach(self):
+        core = getattr(self.model, "transformer", self.model)
+
         # Embeddings
-        emb_mod = getattr(self.model, "embeddings", None) or getattr(self.model, "wte", None)
+        emb_mod = getattr(self.model, "embeddings", None) or getattr(core, "wte", None)
         if emb_mod is not None:
             self._hooks.append(emb_mod.register_forward_hook(self._hook_embed))
 
-        # Blocks: RoBERTa encoder blocks at encoder.layer; GPT-2 blocks at h
+        # Blocks: RoBERTa encoder blocks at encoder.layer; GPT-2 blocks at h (or transformer.h)
         if hasattr(self.model, "encoder") and hasattr(self.model.encoder, "layer"):
             layers = list(self.model.encoder.layer)
             for li, layer in enumerate(layers):
@@ -149,8 +152,8 @@ class ResidualHooks:
                 attn_out = getattr(getattr(layer, "attention", None), "output", None)
                 if attn_out is not None:
                     self._hooks.append(attn_out.register_forward_hook(self._make_pattn_hook(li)))
-        elif hasattr(self.model, "h"):  # GPT-2
-            layers = list(self.model.h)
+        elif hasattr(core, "h"):  # GPT-2 / GPT2LMHeadModel
+            layers = list(core.h)
             for li, block in enumerate(layers):
                 # block input
                 self._hooks.append(block.register_forward_pre_hook(self._make_pre_hook(li)))
@@ -161,9 +164,12 @@ class ResidualHooks:
                 if attn_mod is not None:
                     self._hooks.append(attn_mod.register_forward_hook(self._make_gpt2_pattn_hook(li)))
 
-    # ---- hook fns ----
+    # hook fns
     def _hook_embed(self, mod, inp, out):
-        self.embed = out.detach()
+        # out is usually a Tensor, but keep it robust anyway
+        o = out[0] if isinstance(out, (tuple, list)) else out
+        if torch.is_tensor(o):
+            self.embed = o.detach()
 
     def _make_pre_hook(self, li: int):
         def _pre(mod, inp):
@@ -173,26 +179,32 @@ class ResidualHooks:
 
     def _make_post_hook(self, li: int):
         def _post(mod, inp, out):
-            self.post[li] = out.detach()
+            # RoBERTa layers and GPT-2 blocks can return tuples when output_attentions/hidden_states are enabled
+            o = out[0] if isinstance(out, (tuple, list)) else out
+            if torch.is_tensor(o):
+                self.post[li] = o.detach()
         return _post
 
     def _make_pattn_hook(self, li: int):
         # For RoBERTa: attention.output returns LN(x + attn_out)
         def _pattn(mod, inp, out):
-            self.pattn[li] = out.detach()
+            o = out[0] if isinstance(out, (tuple, list)) else out
+            if torch.is_tensor(o):
+                self.pattn[li] = o.detach()
         return _pattn
 
     def _make_gpt2_pattn_hook(self, li: int):
         # For GPT-2 (pre-LN): approximate post-attn as (pre_attn + attn_out)
+        # GPT2Attention.forward returns a tuple: (attn_output, present, (attn_weights?))
         def _gpt(mod, inp, out):
             x_pre = self.pre.get(li, None)
+            o = out[0] if isinstance(out, (tuple, list)) else out  # unwrap attn_output
+            if not torch.is_tensor(o):
+                return
             if x_pre is not None:
-                try:
-                    self.pattn[li] = (x_pre + out).detach()
-                except Exception:
-                    self.pattn[li] = out.detach()
+                self.pattn[li] = (x_pre + o).detach()
             else:
-                self.pattn[li] = out.detach()
+                self.pattn[li] = o.detach()
         return _gpt
 
     def pop_embed(self):
@@ -204,6 +216,7 @@ class ResidualHooks:
         pre, pattn, post = self.pre, self.pattn, self.post
         self.pre = {}; self.pattn = {}; self.post = {}
         return pre, pattn, post
+
 
 # Decoder-only (GPT-2)
 

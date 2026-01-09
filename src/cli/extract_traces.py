@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoConfig
+from datasets import load_dataset
 
 from src.data.load_text import load_ud_ewt, load_go_emotions
 from src.models.load import load_base
@@ -24,12 +25,69 @@ def get_texts(dataset: str, split: str, limit: int) -> pd.DataFrame:
         df = load_ud_ewt(token_level=False)
         df = df[df["split"] == split].head(limit).copy()
         return df[["example_id", "text"]].reset_index(drop=True)
+
     elif dataset == "go_emotions":
         df, _ = load_go_emotions()
         df = df[df["split"] == split].head(limit).copy()
         return df[["example_id", "text"]].reset_index(drop=True)
+
+    elif dataset == "csqa":
+        ds = load_dataset("commonsense_qa", split=split)
+        if limit is not None:
+            ds = ds.select(range(min(limit, len(ds))))
+
+        def _safe_question_stem(ex):
+            q = ex.get("question", "")
+            if isinstance(q, dict):
+                return q.get("stem", "") or ""
+            if isinstance(q, str):
+                return q
+            return ""
+
+        def _safe_choices(ex):
+            q = ex.get("question", {})
+            choices = None
+            if isinstance(q, dict):
+                choices = q.get("choices", None)
+
+            # commonsense_qa : {"label":[...], "text":[...]}
+            items = []
+            if isinstance(choices, dict) and "label" in choices and "text" in choices:
+                for lab, txt in zip(choices["label"], choices["text"]):
+                    items.append((str(lab), str(txt)))
+            # list of {"label":..,"text":..}
+            elif isinstance(choices, list):
+                for c in choices:
+                    if isinstance(c, dict) and "label" in c and "text" in c:
+                        items.append((str(c["label"]), str(c["text"])))
+
+            # stable order A,B,C,D,E...
+            items.sort(key=lambda x: x[0])
+            return items
+
+        rows = []
+        for j, ex in enumerate(ds):
+            stem = _safe_question_stem(ex)
+            items = _safe_choices(ex)
+
+            lines = [f"Q: {stem}", "Choices:"]
+            for lab, txt in items:
+                lines.append(f"{lab}) {txt}")
+            lines.append("A:")  # answer slot 
+            prompt = "\n".join(lines)
+
+            rows.append({
+                "example_id": ex.get("id", f"csqa_{split}_{j}"),
+                "text": prompt,
+                "answerKey": ex.get("answerKey", None),
+                "csqa_choices": items,
+            })
+
+        return pd.DataFrame(rows).reset_index(drop=True)
+
     else:
-        raise ValueError("dataset must be 'ud_ewt' or 'go_emotions'")
+        raise ValueError("dataset must be 'ud_ewt' or 'go_emotions' or 'csqa'")
+
 
 
 def parse_index_list(lst):
@@ -55,7 +113,8 @@ def _validate_indices(name: str, idxs, maxn: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="roberta-base")
-    ap.add_argument("--dataset", type=str, choices=["ud_ewt", "go_emotions"], default="ud_ewt")
+    #ap.add_argument("--dataset", type=str, choices=["ud_ewt", "go_emotions"], default="ud_ewt")
+    ap.add_argument("--dataset", type=str, choices=["ud_ewt", "go_emotions", "csqa"], default="ud_ewt")
     ap.add_argument("--split", type=str, default="validation")
     ap.add_argument("--limit", type=int, default=32)
     ap.add_argument("--max_seq_len", type=int, default=128)
@@ -291,7 +350,7 @@ def main():
                                               shape=(len(texts), L_dec + 1, T_dec, D_dec),
                                               chunks=(1, 1, T_dec, D_dec), dtype=dtype)
 
-    # Residual streams (optional)
+    # Residual streams 
     # Encoder-only: res_embed / res_pre_attn / res_post_attn / res_post_mlp
     # Decoder-only: dec_res_*
     # Enc-Dec:      enc_res_* and dec_res_*
@@ -376,7 +435,7 @@ def main():
                     if "attention_mask" in dec:
                         batch["decoder_attention_mask"] = dec["attention_mask"][sl].to(device)
                 else:
-                    # No targets → provide a 1-token dummy so T5 runs the encoder cleanly
+                    # No targets ; provide a 1-token dummy so T5 runs the encoder cleanly
                     start_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
                     B = sl.stop - sl.start
                     d_ids = torch.full((B, 1), int(start_id), device=device, dtype=torch.long)
@@ -573,6 +632,12 @@ def main():
         "offset_mapping": enc["offset_mapping"].cpu().tolist(),
     })
     df_tok["tokens"] = [tok.convert_ids_to_tokens(row) for row in df_tok["input_ids"]]
+    # CSQA extras 
+    if "answerKey" in texts.columns:
+        df_tok["answerKey"] = texts["answerKey"].tolist()
+    if "csqa_choices" in texts.columns:
+        df_tok["csqa_choices"] = texts["csqa_choices"].tolist()
+    # /
     if arch == "encdec" and dec is not None:
         df_tok["dec_input_ids"] = dec["input_ids"].cpu().tolist()
         df_tok["dec_attention_mask"] = dec["attention_mask"].cpu().tolist() if "attention_mask" in dec else None

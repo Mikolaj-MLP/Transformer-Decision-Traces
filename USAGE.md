@@ -189,6 +189,13 @@ print("row-sum≈1 (enc, non-pad):", float(A_enc[:L,:L].sum(-1).mean()))
 
 Common commands (copy/paste)
 
+# GPT 2 every trace csqa dataset 
+python -m src.cli.extract_trace_csqa_gpt 
+--split validation 
+--batch_size 8 
+--max_seq_len auto 
+--capture attn qkv hidden resid
+
 # RoBERTa, 32 samples, all layers/heads
 python -m src.cli.extract_traces --model roberta-base --dataset ud_ewt --split validation --limit 32 --max_seq_len 128 --capture attn qkv
 

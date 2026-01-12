@@ -18,38 +18,6 @@ Outputs are chunked **Zarr** arrays with a **tokens.parquet** and **meta.json** 
 
 ## Quick start
 
-```powershell
-
-# 1) Prepare datasets (UD English-EWT, GoEmotions)
-python -m src.data.prepare_datasets
-
-# 2) Run an encoder (RoBERTa) trace extraction
-python -m src.cli.extract_traces --model roberta-base --dataset ud_ewt --split validation --limit 24 --max_seq_len 128 --capture attn qkv hidden --layers-enc "0,6,11" --heads-enc "0,3,7"
-
-# 3) Inspect latest run in a notebook
-# (See "Python API" below)
-
-
-  Data preparation
-Two public English datasets are supported:
-
-# UD English-EWT
-python -m src.data.prepare_datasets --which ud
-
-# GoEmotions
-python -m src.data.prepare_datasets --which go
-
-# Both
-python -m src.data.prepare_datasets
-
-
-Artifacts land in data/processed/:
-
-ud_ewt.parquet
-
-go_emotions.parquet
-
-
 Extract traces (CLI)
 
 python -m src.cli.extract_traces `
@@ -67,7 +35,7 @@ Encoder-only (RoBERTa)
 
 python -m src.cli.extract_traces --model roberta-base `
   --dataset ud_ewt --split validation `
-  --limit 24 --max_seq_len 128 `
+  --limit INT --max_seq_len INT `
   --capture attn qkv hidden `
   --layers-enc "0,6,11" --heads-enc "0,3,7"
 
@@ -75,7 +43,7 @@ Decoder-only (GPT-2)
 
 python -m src.cli.extract_traces --model gpt2 `
   --dataset ud_ewt --split validation `
-  --limit 16 --max_seq_len 128 `
+  --limit INT --max_seq_len INT `
   --capture attn qkv `
   --layers-dec "0,5,11" --heads-dec "0,1,7"
 
@@ -95,11 +63,9 @@ python -m src.cli.extract_traces --model t5-small `
   --layers-enc "0,3,5" --heads-enc "0,2,6"
 
 
-If you omit --targets_file, we inject a 1-token dummy decoder_input_ids so the encoder runs; only encoder arrays are saved.
+If you omit --targets_file, code injects a 1-token dummy decoder_input_ids so the encoder runs; only encoder arrays are saved.
 
 Encoder + Decoder Self + Cross (with targets)
-
-python -c "import pandas as pd; df=pd.read_parquet('data/processed/ud_ewt.parquet'); val=df[df.split=='validation'].head(12); open('data/targets_dummy.txt','w',encoding='utf-8').write('\n'.join(val.text.tolist()))"
 
 python -m src.cli.extract_traces --model t5-small `
   --dataset ud_ewt --split validation `
@@ -108,11 +74,6 @@ python -m src.cli.extract_traces --model t5-small `
   --capture attn qkv hidden `
   --layers-enc '0,3,5' --heads-enc '0,2,6' `
   --layers-dec '0,3,5' --heads-dec '0,2,6'
-
-
-Index validation: If you pass out-of-range layers/heads (e.g., 11 for t5-small which has 6 layers), the CLI drops them and prints:
-[warn] dropping out-of-range layers-enc [11]; valid range = 0..5
-
 
 Output layout
 Each run writes to traces/<RUN_ID>/ (atomic: _tmp_<RUN_ID> → <RUN_ID>):
@@ -145,7 +106,29 @@ attn chunks: (1,1,1,T,T)
 q/k/v chunks: (1,1,1,T,d_head)
 
 Default dtype: fp16 (use --dtype float32 to change)
+# ----
+# Produces :
 
+traces/<RUN_ID>/
+├─ meta.json
+├─ tokens.parquet
+├─ dec_self_attn.zarr/
+│   └─ attn            (N, L, H, T, T)
+├─ dec_self_qkv.zarr/
+│   ├─ q               (N, L, H, T, d)
+│   ├─ k               (N, L, H, T, d)
+│   └─ v               (N, L, H, T, d)
+├─ dec_hidden.zarr/
+│   └─ h               (N, L+1, T, D)
+├─ dec_res_embed.zarr/
+│   └─ x               (N, T, D)
+├─ dec_res_pre_attn.zarr/
+│   └─ x               (N, L, T, D)
+├─ dec_res_post_attn.zarr/
+│   └─ x               (N, L, T, D)
+└─ dec_res_post_mlp.zarr/
+    └─ x               (N, L, T, D)
+# ----
 
 Python API (TraceStore)
 
@@ -179,15 +162,8 @@ A_x   = st.attn(eid, side="dec", kind="cross", layer=0, head=0)  # (T_dec, T_enc
 Q_x   = st.qkv(eid, "q", side="dec", kind="cross", layer=0, head=0)
 K_x   = st.qkv(eid, "k", side="dec", kind="cross", layer=0, head=0)
 
-# Trim pads & sanity
-enc = st.encodings(eid)
-mask = np.array(enc["attention_mask"], bool)
-L = int(mask.sum())
-print("row-sum≈1 (enc, non-pad):", float(A_enc[:L,:L].sum(-1).mean()))
 
-
-
-Common commands (copy/paste)
+Commands (copy/paste)
 
 # GPT 2 every trace csqa dataset 
 python -m src.cli.extract_trace_csqa_gpt 
@@ -206,29 +182,4 @@ python -m src.cli.extract_traces --model gpt2 --dataset ud_ewt --split validatio
 python -m src.cli.extract_traces --model t5-small --dataset ud_ewt --split validation --limit 12 --max_seq_len 128 --capture attn qkv hidden --layers-enc "0,5,11" --heads-enc "0,2,6"
 
 # T5 with decoder & cross (needs targets)
-python -c "import pandas as pd; df=pd.read_parquet('data/processed/ud_ewt.parquet'); val=df[df.split=='validation'].head(12); open('data/targets_dummy.txt','w',encoding='utf-8').write('\n'.join(val.text.tolist()))"
 python -m src.cli.extract_traces --model t5-small --dataset ud_ewt --split validation --limit 12 --max_seq_len 128 --dec_max_len 64 --targets_file data/targets_dummy.txt --capture attn qkv hidden --layers-enc '0,3,5' --heads-enc '0,2,6' --layers-dec '0,3,5' --heads-dec '0,2,6'
-
-
-Troubleshooting
-Windows symlink warning (HF hub): safe to ignore; uses copies if symlinks disabled.
-
-T5 index out of bounds: we now drop invalid layer/head indices and warn.
-
-T5 requires decoder_input_ids: handled (dummy 1-token when no --targets_file).
-
-GPT-2 pad token missing: handled (we set pad_token = eos_token).
-
-
-
-
-Roadmap
-
---capture mlp persistence (hooks exist; on-disk writing will be added on demand).
-
-MNLI baseline + eval CLI to tag examples correct/incorrect for error-trace analyses.
-
-
-::contentReference[oaicite:0]{index=0}
-
-

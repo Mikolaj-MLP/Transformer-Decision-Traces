@@ -2,13 +2,13 @@
 from __future__ import annotations
 import os, json, time, argparse, shutil
 from pathlib import Path
-
+import warnings
 import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoConfig
 from datasets import load_dataset
-
+from src.data.load_csqa import load_csqa
 from src.data.load_text import load_ud_ewt, load_go_emotions
 from src.models.load import load_base
 from src.models.hooks import QKVHooks, GPT2QKVHooks, T5QKVHooks, MLPHooks, ResidualHooks
@@ -32,58 +32,9 @@ def get_texts(dataset: str, split: str, limit: int) -> pd.DataFrame:
         return df[["example_id", "text"]].reset_index(drop=True)
 
     elif dataset == "csqa":
-        ds = load_dataset("commonsense_qa", split=split)
-        if limit is not None:
-            ds = ds.select(range(min(limit, len(ds))))
 
-        def _safe_question_stem(ex):
-            q = ex.get("question", "")
-            if isinstance(q, dict):
-                return q.get("stem", "") or ""
-            if isinstance(q, str):
-                return q
-            return ""
-
-        def _safe_choices(ex):
-            q = ex.get("question", {})
-            choices = None
-            if isinstance(q, dict):
-                choices = q.get("choices", None)
-
-            # commonsense_qa : {"label":[...], "text":[...]}
-            items = []
-            if isinstance(choices, dict) and "label" in choices and "text" in choices:
-                for lab, txt in zip(choices["label"], choices["text"]):
-                    items.append((str(lab), str(txt)))
-            # list of {"label":..,"text":..}
-            elif isinstance(choices, list):
-                for c in choices:
-                    if isinstance(c, dict) and "label" in c and "text" in c:
-                        items.append((str(c["label"]), str(c["text"])))
-
-            # stable order A,B,C,D,E...
-            items.sort(key=lambda x: x[0])
-            return items
-
-        rows = []
-        for j, ex in enumerate(ds):
-            stem = _safe_question_stem(ex)
-            items = _safe_choices(ex)
-
-            lines = [f"Q: {stem}", "Choices:"]
-            for lab, txt in items:
-                lines.append(f"{lab}) {txt}")
-            lines.append("A:")  # answer slot 
-            prompt = "\n".join(lines)
-
-            rows.append({
-                "example_id": ex.get("id", f"csqa_{split}_{j}"),
-                "text": prompt,
-                "answerKey": ex.get("answerKey", None),
-                "csqa_choices": items,
-            })
-
-        return pd.DataFrame(rows).reset_index(drop=True)
+        df = load_csqa(split=split, limit=limit)
+        return df.reset_index(drop=True)
 
     else:
         raise ValueError("dataset must be 'ud_ewt' or 'go_emotions' or 'csqa'")
@@ -145,7 +96,21 @@ def main():
     tok, model, device = load_base(args.model)
     cfg = AutoConfig.from_pretrained(args.model)
 
-    # --- ARCH DETECTION (robust & minimal) ---
+    #GPT-2 padding policy 
+    # GPT-2 has no native pad token -> use eos as pad.
+    if getattr(tok, "pad_token_id", None) is None:
+        if getattr(tok, "eos_token_id", None) is None:
+            raise ValueError("Tokenizer has neither pad_token_id nor eos_token_id.")
+        tok.pad_token = tok.eos_token
+
+    # Force RIGHT padding so active tokens start at index 0.
+    tok.padding_side = "right"
+
+    # warn if something tries to override it later
+    if tok.padding_side != "right":
+        warnings.warn(f"tokenizer.padding_side is {tok.padding_side} (expected right)")
+
+    # ARCH DETECTION
     is_encdec = bool(getattr(cfg, "is_encoder_decoder", False))
     model_type = str(getattr(cfg, "model_type", "")).lower()
     # treat these families as decoder-only even if cfg.is_decoder isn't set
@@ -162,7 +127,7 @@ def main():
     # Ensure a PAD token exists (GPT-2 et al. don't ship one)
     if getattr(tok, "pad_token_id", None) is None and getattr(tok, "eos_token_id", None) is not None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "left" if arch == "dec" else "right"
+    tok.padding_side = "right"
     # Tokenize encoder/source texts
     enc = tok(
         texts["text"].tolist(),
@@ -631,7 +596,13 @@ def main():
         "attention_mask": enc["attention_mask"].cpu().tolist(),
         "offset_mapping": enc["offset_mapping"].cpu().tolist(),
     })
-    df_tok["tokens"] = [tok.convert_ids_to_tokens(row) for row in df_tok["input_ids"]]
+    # Ensure tokens length == T for every row
+    input_ids_list = df_tok["input_ids"].tolist()
+    df_tok["tokens"] = [tok.convert_ids_to_tokens(ids) for ids in input_ids_list]
+    # Hard assertion (fail fast if something is wrong)
+    T = len(input_ids_list[0]) if input_ids_list else 0
+    assert all(isinstance(t, list) and len(t) == T for t in df_tok["tokens"]), \
+        "tokens column must be list-of-length T for every example"
     # CSQA extras 
     if "answerKey" in texts.columns:
         df_tok["answerKey"] = texts["answerKey"].tolist()

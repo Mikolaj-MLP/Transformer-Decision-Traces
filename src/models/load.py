@@ -5,9 +5,19 @@ from transformers import AutoTokenizer, AutoModel, AutoConfig, AutoModelForCausa
 def device_auto():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
-def load_base(model_name: str = "roberta-base", device: str | None = None):
-    tok = AutoTokenizer.from_pretrained(model_name)
-    cfg = AutoConfig.from_pretrained(model_name)
+def load_base(
+    model_name: str = "roberta-base",
+    device: str | None = None,
+    model_path: str | None = None,
+):
+    """
+    model_name: HF hub id (e.g. 'gpt2', 'roberta-base')
+    model_path: local checkpoint directory in HF format; overrides model_name when provided
+    """
+    model_id = model_path or model_name
+
+    tok = AutoTokenizer.from_pretrained(model_id)
+    cfg = AutoConfig.from_pretrained(model_id)
 
     is_encdec = bool(getattr(cfg, "is_encoder_decoder", False))
     model_type = str(getattr(cfg, "model_type", "")).lower()

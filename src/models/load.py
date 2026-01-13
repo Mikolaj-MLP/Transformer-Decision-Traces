@@ -30,11 +30,11 @@ def load_base(
     )
 
     if is_encdec:
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_id)
     elif is_decoder_only:
-        model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager")
+        model = AutoModelForCausalLM.from_pretrained(model_id, attn_implementation="eager")
     else:
-        model = AutoModel.from_pretrained(model_name, attn_implementation="eager")
+        model = AutoModel.from_pretrained(model_id, attn_implementation="eager")
 
     model.config.output_attentions = True
     model.config.output_hidden_states = True

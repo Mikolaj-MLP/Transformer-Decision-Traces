@@ -34,8 +34,9 @@ def get_texts(dataset: str, split: str, limit: int) -> pd.DataFrame:
     elif dataset == "csqa":
 
         df = load_csqa(split=split, limit=limit)
-        return df.reset_index(drop=True)
-
+        # keep csqa metadata columns!
+        keep = ["example_id", "text", "answerKey", "correct_idx", "csqa_choices"]
+        return df[keep].reset_index(drop=True)
     else:
         raise ValueError("dataset must be 'ud_ewt' or 'go_emotions' or 'csqa'")
 

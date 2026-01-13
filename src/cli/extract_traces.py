@@ -64,6 +64,7 @@ def _validate_indices(name: str, idxs, maxn: int):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model_path", type=str, default=None, help="local checkpoint dir; overrides --model")
     ap.add_argument("--model", type=str, default="roberta-base")
     #ap.add_argument("--dataset", type=str, choices=["ud_ewt", "go_emotions"], default="ud_ewt")
     ap.add_argument("--dataset", type=str, choices=["ud_ewt", "go_emotions", "csqa"], default="ud_ewt")
@@ -94,8 +95,8 @@ def main():
 
     texts = get_texts(args.dataset, args.split, args.limit)
 
-    tok, model, device = load_base(args.model)
-    cfg = AutoConfig.from_pretrained(args.model)
+    tok, model, device = load_base(args.model, model_path=args.model_path)
+    cfg = AutoConfig.from_pretrained(args.model_path or args.model)
 
     #GPT-2 padding policy 
     # GPT-2 has no native pad token -> use eos as pad.

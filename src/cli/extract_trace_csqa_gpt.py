@@ -21,6 +21,7 @@ def now_id() -> str:
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model_path", type=str, default=None, help="local fine-tuned checkpoint dir")
     ap.add_argument("--split", type=str, default="validation", choices=["train", "validation", "test"])
     ap.add_argument("--out_dir", type=str, default=None)
     ap.add_argument("--batch_size", type=int, default=8)
@@ -41,8 +42,9 @@ def main():
 
     # model
     model_name = "gpt2"
-    tok, model, device = load_base(model_name)
-    cfg = AutoConfig.from_pretrained(model_name)
+    model_id = args.model_path or model_name
+    tok, model, device = load_base(model_name, model_path=args.model_path)
+    cfg = AutoConfig.from_pretrained(model_id)
 
     # GPT-2: create PAD token by aliasing EOS
     if tok.pad_token_id is None and tok.eos_token_id is not None:
@@ -204,7 +206,7 @@ def main():
 
     meta = {
         "run_id": final_root.name,
-        "model": model_name,
+        "model": model_id,
         "arch": "dec",
         "dataset": "csqa",
         "split": args.split,

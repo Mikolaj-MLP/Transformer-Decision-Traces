@@ -28,7 +28,7 @@ Thumbs.db
 .ipynb_checkpoints/
 .jupyter/
 
-# Testing / lint
+# Testing 
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -61,7 +61,7 @@ wandb/
 mlruns/
 outputs/
 
-# Common ML 
+# ML stuff
 *.pt
 *.bin
 *.ckpt

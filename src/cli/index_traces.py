@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse, json, os
 from pathlib import Path
-from src.traces.store import TraceStore
+from src.traces_utils.store import TraceStore
 
 def main():
     ap = argparse.ArgumentParser()

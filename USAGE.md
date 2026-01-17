@@ -1,4 +1,4 @@
-# Transformer-Decision-Traces — Usage Guide
+# Transformer-Decision-Traces — Usage Guide     !!!! OUTDATED !!!!
 
 This repo extracts **structured decision traces** from Transformer models on text inputs and lets you inspect them offline.
 

@@ -68,10 +68,13 @@ class TraceStore:
         self._attn_dec = self._q_dec = self._k_dec = self._v_dec = None
         self._attn_x   = self._q_x   = self._k_x   = self._v_x   = None  # cross-attn (dec→enc)
         self._hidden_enc = self._hidden_dec = None
+        self._mc_attn = self._mc_q = self._mc_k = self._mc_v = None
+        self._mc_hidden = None
 
         # residuals
         self._res_enc_embed = self._res_enc_pre = self._res_enc_pattn = self._res_enc_post = None
         self._res_dec_embed = self._res_dec_pre = self._res_dec_pattn = self._res_dec_post = None
+        self._res_mc_embed = self._res_mc_pre = self._res_mc_pattn = self._res_mc_post = None
 
         self._load_arrays_if_exist()
 
@@ -126,6 +129,13 @@ class TraceStore:
         if self._hidden_enc is not None: out["enc_hidden"] = tuple(self._hidden_enc.shape)
         if self._hidden_dec is not None: out["dec_hidden"] = tuple(self._hidden_dec.shape)
 
+        # Encoder MCQ
+        if self._mc_attn is not None: out["enc_mc_attn"] = tuple(self._mc_attn.shape)
+        if self._mc_q    is not None: out["enc_mc_q"]    = tuple(self._mc_q.shape)
+        if self._mc_k    is not None: out["enc_mc_k"]    = tuple(self._mc_k.shape)
+        if self._mc_v    is not None: out["enc_mc_v"]    = tuple(self._mc_v.shape)
+        if self._mc_hidden is not None: out["enc_mc_hidden"] = tuple(self._mc_hidden.shape)
+
         # Residuals (encoder side)
         if self._res_enc_embed is not None: out["enc_res_embed"]    = tuple(self._res_enc_embed.shape)   # (N,T,D)
         if self._res_enc_pre   is not None: out["enc_res_pre_attn"] = tuple(self._res_enc_pre.shape)     # (N,L_sel,T,D)
@@ -137,6 +147,12 @@ class TraceStore:
         if self._res_dec_pre   is not None: out["dec_res_pre_attn"] = tuple(self._res_dec_pre.shape)     # (N,L_sel,T,D)
         if self._res_dec_pattn is not None: out["dec_res_post_attn"]= tuple(self._res_dec_pattn.shape)   # (N,L_sel,T,D)
         if self._res_dec_post  is not None: out["dec_res_post_mlp"] = tuple(self._res_dec_post.shape)    # (N,L_sel,T,D)
+
+        # Residuals (encoder MCQ side)
+        if self._res_mc_embed is not None: out["enc_mc_res_embed"] = tuple(self._res_mc_embed.shape)
+        if self._res_mc_pre   is not None: out["enc_mc_res_pre_attn"] = tuple(self._res_mc_pre.shape)
+        if self._res_mc_pattn is not None: out["enc_mc_res_post_attn"] = tuple(self._res_mc_pattn.shape)
+        if self._res_mc_post  is not None: out["enc_mc_res_post_mlp"] = tuple(self._res_mc_post.shape)
 
         return out
 
@@ -220,6 +236,51 @@ class TraceStore:
             return np.asarray(self._hidden_dec[self.row(example_id)])
         raise RuntimeError("Requested hidden states not present.")
 
+    # accessors: encoder MCQ (choice-aware)
+    def mcq_attn(self, example_id: str, choice_idx: int, layer: Optional[int] = None, head: Optional[int] = None) -> np.ndarray:
+        """
+        Encoder MCQ attention accessor.
+        Stored shape: (N, C, L, H, T, T)
+        """
+        if self._mc_attn is None:
+            raise RuntimeError("Requested enc_mc_attn not present.")
+        i = self.row(example_id)
+        x = self._mc_attn[i, choice_idx]  # (L,H,T,T)
+        if layer is not None:
+            x = x[layer]
+            if head is not None:
+                x = x[head]
+        elif head is not None:
+            x = x[:, head]
+        return np.asarray(x)
+
+    def mcq_qkv(self, example_id: str, choice_idx: int, which: str = "q", layer: Optional[int] = None, head: Optional[int] = None) -> np.ndarray:
+        """
+        Encoder MCQ Q/K/V accessor.
+        Stored shape: (N, C, L, H, T, d)
+        """
+        arr = {"q": self._mc_q, "k": self._mc_k, "v": self._mc_v}[which]
+        if arr is None:
+            raise RuntimeError(f"Requested enc_mc_{which} not present.")
+        i = self.row(example_id)
+        x = arr[i, choice_idx]  # (L,H,T,d)
+        if layer is not None:
+            x = x[layer]
+            if head is not None:
+                x = x[head]
+        elif head is not None:
+            x = x[:, head]
+        return np.asarray(x)
+
+    def mcq_hidden(self, example_id: str, choice_idx: int) -> np.ndarray:
+        """
+        Encoder MCQ hidden accessor.
+        Stored shape: (N, C, L+1, T, D)
+        """
+        if self._mc_hidden is None:
+            raise RuntimeError("Requested enc_mc_hidden not present.")
+        return np.asarray(self._mc_hidden[self.row(example_id), choice_idx])
+
     # accessors: residual streams
     def resid_embed(self, example_id: str, side: str = "enc") -> np.ndarray:
         """
@@ -245,6 +306,34 @@ class TraceStore:
         if arr is None:
             raise RuntimeError(f"Requested residual stage '{stage}' not present for side='{side}'.")
         x = arr[i]  # (L_sel, T, D)
+        if layer is not None:
+            x = x[layer]
+        return np.asarray(x)
+
+    def mcq_resid_embed(self, example_id: str, choice_idx: int) -> np.ndarray:
+        """
+        Encoder MCQ embedding residual stream.
+        Stored shape: (N, C, T, D)
+        """
+        if self._res_mc_embed is None:
+            raise RuntimeError("Requested enc_mc_res_embed not present.")
+        return np.asarray(self._res_mc_embed[self.row(example_id), choice_idx])
+
+    def mcq_resid(self, example_id: str, choice_idx: int, stage: str, layer: Optional[int] = None) -> np.ndarray:
+        """
+        stage in {"pre_attn", "post_attn", "post_mlp"}
+        Stored shape for stage arrays: (N, C, L, T, D)
+        """
+        arr = None
+        if stage == "pre_attn":
+            arr = self._res_mc_pre
+        elif stage == "post_attn":
+            arr = self._res_mc_pattn
+        elif stage == "post_mlp":
+            arr = self._res_mc_post
+        if arr is None:
+            raise RuntimeError(f"Requested enc_mc residual stage '{stage}' not present.")
+        x = arr[self.row(example_id), choice_idx]  # (L,T,D)
         if layer is not None:
             x = x[layer]
         return np.asarray(x)
@@ -299,6 +388,16 @@ class TraceStore:
             self._q_dec = _zget(g, "q"); self._k_dec = _zget(g, "k"); self._v_dec = _zget(g, "v")
         p = rd / "dec_hidden.zarr"
         if p.exists(): self._hidden_dec = zarr.open(p, mode="r")["h"]
+
+        # encoder MCQ
+        p = rd / "enc_mc_attn.zarr"
+        if p.exists(): self._mc_attn = zarr.open(p, mode="r")["attn"]
+        p = rd / "enc_mc_qkv.zarr"
+        if p.exists():
+            g = zarr.open(p, mode="r")
+            self._mc_q = _zget(g, "q"); self._mc_k = _zget(g, "k"); self._mc_v = _zget(g, "v")
+        p = rd / "enc_mc_hidden.zarr"
+        if p.exists(): self._mc_hidden = zarr.open(p, mode="r")["h"]
 
         # encoder–decoder (T5)
         p = rd / "enc_self_attn.zarr"
@@ -359,6 +458,17 @@ class TraceStore:
             if p.exists():
                 node = zarr.open(p, mode="r")["x"]
                 setattr(self, attr, node)
+
+        # residuals: encoder MCQ side
+        for fname, attr in [
+            ("enc_mc_res_embed.zarr",      "_res_mc_embed"),
+            ("enc_mc_res_pre_attn.zarr",   "_res_mc_pre"),
+            ("enc_mc_res_post_attn.zarr",  "_res_mc_pattn"),
+            ("enc_mc_res_post_mlp.zarr",   "_res_mc_post"),
+        ]:
+            p = rd / fname
+            if p.exists():
+                setattr(self, attr, zarr.open(p, mode="r")["x"])
 
     # utilities
     def build_index(self, persist: bool = True) -> Dict[str, int]:

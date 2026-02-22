@@ -20,6 +20,18 @@ def now_id():
     return time.strftime("%Y%m%d-%H%M%S")
 
 
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _resolve_out_dir(out_dir: str | None, run_id: str) -> Path:
+    root = _repo_root()
+    if out_dir is None:
+        return root / "traces" / run_id
+    p = Path(out_dir)
+    return p if p.is_absolute() else (root / p)
+
+
 def get_texts(dataset: str, split: str, limit: int) -> pd.DataFrame:
     if dataset == "ud_ewt":
         df = load_ud_ewt(token_level=False)
@@ -202,7 +214,7 @@ def main():
 
     # Run id / atomic dirs
     run_id = f"{now_id()}_{args.model}_{args.dataset}_{args.split}_n{len(texts)}"
-    final_root = Path(args.out_dir or f"traces/{run_id}")
+    final_root = _resolve_out_dir(args.out_dir, run_id)
     tmp_root = final_root.parent / f"_tmp_{final_root.name}"
     if tmp_root.exists():
         shutil.rmtree(tmp_root)

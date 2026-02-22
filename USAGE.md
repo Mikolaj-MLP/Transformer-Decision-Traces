@@ -1,185 +1,171 @@
-# Transformer-Decision-Traces — Usage Guide     !!!! OUTDATED !!!!
+# Transformer Decision Traces - Usage
 
-This repo extracts **structured decision traces** from Transformer models on text inputs and lets you inspect them offline.
+This repository is for extracting and analyzing **internal decision traces** from Transformer models.
 
-It can capture:
-- **Attention** matrices (per layer/head)
-- **Q/K/V** vectors (per layer/head)
-- **Hidden states** (optional)
+Main outputs are saved per run in `traces/<RUN_ID>/`:
+- `meta.json` (run metadata)
+- `tokens.parquet` (text + tokenization + predictions/labels)
+- one or more Zarr arrays (`*.zarr`) for attention, Q/K/V, hidden states, and residual streams
 
-Supports:
-- **Encoders** (e.g., `roberta-base`)
-- **Decoders** (e.g., `gpt2`) — causal self-attn
-- **Encoder–decoders** (e.g., `t5-small`) — encoder self, decoder self, and cross-attn (when targets provided)
+Default output is always inside this repo under `traces/`.
 
-Outputs are chunked **Zarr** arrays with a **tokens.parquet** and **meta.json** per run. A small `TraceStore` API gives random access to any example.
+## What Works Here
 
----
+### 1) Decoder traces on CSQA prompts (GPT-2 style)
+Script: `src/cli/extract_trace_csqa_gpt.py`
 
-## Quick start
+Captures decoder self-attention/QKV/hidden/residual traces for CSQA-formatted prompts.
 
-Extract traces (CLI)
+### 2) Decoder next-token traces (label-free LM analysis)
+Script: `src/cli/extract_trace_nexttok_dec.py`
 
-python -m src.cli.extract_traces `
-  --model <hf_model_name> `
-  --dataset {ud_ewt|go_emotions} --split {train|validation|test} `
-  --limit <N> --max_seq_len <T_enc> `
-  --capture <one-or-more of: attn qkv hidden> `
-  [--layers-enc "i,j,k"] [--heads-enc "i,j,k"] `
-  [--layers-dec "i,j,k"] [--heads-dec "i,j,k"] `
-  [--dec_max_len <T_dec>] [--targets_file <path>] `
-  [--out_dir <traces/custom_name>]
+Datasets supported:
+- `ud_ewt`
+- `go_emotions`
+- `csqa`
+- `wikitext2`
+- `wikitext103`
 
+Adds next-token diagnostics to `tokens.parquet`:
+- `next_pos`, `next_true_id`, `next_pred_id`, `next_correct`
+- `next_true_prob`, `next_pred_prob`, `next_entropy`
+- `next_topk_ids`, `next_topk_tokens`, `next_topk_probs`
 
-Encoder-only (RoBERTa)
+### 3) Encoder multiple-choice traces on CSQA
+Script: `src/cli/extract_trace_csqa_enc.py`
 
-python -m src.cli.extract_traces --model roberta-base `
-  --dataset ud_ewt --split validation `
-  --limit INT --max_seq_len INT `
-  --capture attn qkv hidden `
-  --layers-enc "0,6,11" --heads-enc "0,3,7"
+Captures per-choice encoder traces for multiple-choice models (`AutoModelForMultipleChoice`), with:
+- `label_idx`, `pred_idx`, `pred_label`, `is_correct`
+- `choice_logits`, `choice_probs`
 
-Decoder-only (GPT-2)
+### 4) Fine-tune encoder model on CSQA
+Script: `src/cli/finetune_csqa_enc.py`
 
-python -m src.cli.extract_traces --model gpt2 `
-  --dataset ud_ewt --split validation `
-  --limit INT --max_seq_len INT `
-  --capture attn qkv `
-  --layers-dec "0,5,11" --heads-dec "0,1,7"
+Trains an encoder MCQ model and saves a checkpoint for trace extraction.
 
-Notes:
+## Typical Workflows
 
-set a pad token for GPT-2 automatically (uses eos).
+### A) Decoder next-token workflow
+1. Extract traces:
 
-Expect causal (lower-triangular) attention.
+```powershell
+python -m src.cli.extract_trace_nexttok_dec `
+  --model gpt2 `
+  --dataset wikitext2 `
+  --split validation `
+  --limit 500 `
+  --max_seq_len 256 `
+  --capture hidden resid `
+  --batch_size 8 `
+  --out_dir traces\wt2_val500_gpt2
+```
 
-Encoder–decoder (T5)
-Encoder side only (no targets)
+2. Validate run:
 
-python -m src.cli.extract_traces --model t5-small `
-  --dataset ud_ewt --split validation `
-  --limit 12 --max_seq_len 128 `
-  --capture attn qkv hidden `
-  --layers-enc "0,3,5" --heads-enc "0,2,6"
+```powershell
+python -m src.cli.index_traces traces\wt2_val500_gpt2 --validate
+```
 
+3. Analyze in notebook:
+- `nexttok_trace_analysis.ipynb`
 
-If you omit --targets_file, code injects a 1-token dummy decoder_input_ids so the encoder runs; only encoder arrays are saved.
+### B) Decoder CSQA prompt workflow
 
-Encoder + Decoder Self + Cross (with targets)
+```powershell
+python -m src.cli.extract_trace_csqa_gpt `
+  --split validation `
+  --limit 500 `
+  --batch_size 8 `
+  --max_seq_len auto `
+  --capture attn qkv hidden resid `
+  --out_dir traces\csqa_dec500
+```
 
-python -m src.cli.extract_traces --model t5-small `
-  --dataset ud_ewt --split validation `
-  --limit 12 --max_seq_len 128 --dec_max_len 64 `
-  --targets_file data/targets_dummy.txt `
-  --capture attn qkv hidden `
-  --layers-enc '0,3,5' --heads-enc '0,2,6' `
-  --layers-dec '0,3,5' --heads-dec '0,2,6'
+### C) Encoder CSQA classification workflow
+1. Fine-tune:
 
-Output layout
-Each run writes to traces/<RUN_ID>/ (atomic: _tmp_<RUN_ID> → <RUN_ID>):
-traces/<RUN_ID>/
-  meta.json
-  tokens.parquet
-  # encoder-only
-  attn.zarr/attn
-  qkv.zarr/{q,k,v}
-  hidden.zarr/h
+```powershell
+python -m src.cli.finetune_csqa_enc `
+  --model roberta-base `
+  --max_seq_len 128 `
+  --batch_size 8 `
+  --lr 2e-5 `
+  --epochs 2 `
+  --gradient_checkpointing
+```
 
-  # decoder-only
-  dec_self_attn.zarr/attn
-  dec_self_qkv.zarr/{q,k,v}
-  dec_hidden.zarr/h
+2. Extract traces from trained checkpoint:
 
-  # encoder–decoder
-  enc_self_attn.zarr/attn
-  enc_self_qkv.zarr/{q,k,v}
-  enc_hidden.zarr/h
-  # (when targets provided)
-  dec_self_attn.zarr/attn
-  dec_self_qkv.zarr/{q,k,v}
-  dec_cross_attn.zarr/attn
-  dec_cross_qkv.zarr/{q,k,v}
-  dec_hidden.zarr/h
+```powershell
+python -m src.cli.extract_trace_csqa_enc `
+  --model roberta-base `
+  --model_path checkpoints\YOUR_RUN_DIR `
+  --split validation `
+  --limit 250 `
+  --batch_size 4 `
+  --max_seq_len 128 `
+  --capture hidden resid `
+  --out_dir traces\csqa_enc_val250_ft
+```
 
-attn chunks: (1,1,1,T,T)
+3. Validate run:
 
-q/k/v chunks: (1,1,1,T,d_head)
+```powershell
+python -m src.cli.index_traces traces\csqa_enc_val250_ft --validate
+```
 
-Default dtype: fp16 (use --dtype float32 to change)
-# ----
-# Produces :
+## Output Shapes (Quick Reference)
 
-traces/<RUN_ID>/
-├─ meta.json
-├─ tokens.parquet
-├─ dec_self_attn.zarr/
-│   └─ attn            (N, L, H, T, T)
-├─ dec_self_qkv.zarr/
-│   ├─ q               (N, L, H, T, d)
-│   ├─ k               (N, L, H, T, d)
-│   └─ v               (N, L, H, T, d)
-├─ dec_hidden.zarr/
-│   └─ h               (N, L+1, T, D)
-├─ dec_res_embed.zarr/
-│   └─ x               (N, T, D)
-├─ dec_res_pre_attn.zarr/
-│   └─ x               (N, L, T, D)
-├─ dec_res_post_attn.zarr/
-│   └─ x               (N, L, T, D)
-└─ dec_res_post_mlp.zarr/
-    └─ x               (N, L, T, D)
-# ----
+### Decoder traces
+- `dec_self_attn.zarr/attn`: `(N, L, H, T, T)`
+- `dec_self_qkv.zarr/{q,k,v}`: `(N, L, H, T, d_head)`
+- `dec_hidden.zarr/h`: `(N, L+1, T, D)`
+- `dec_res_embed.zarr/x`: `(N, T, D)`
+- `dec_res_pre_attn.zarr/x`: `(N, L, T, D)`
+- `dec_res_post_attn.zarr/x`: `(N, L, T, D)`
+- `dec_res_post_mlp.zarr/x`: `(N, L, T, D)`
 
-Python API (TraceStore)
+### Encoder MCQ traces
+- `enc_mc_attn.zarr/attn`: `(N, C, L, H, T, T)`
+- `enc_mc_qkv.zarr/{q,k,v}`: `(N, C, L, H, T, d_head)`
+- `enc_mc_hidden.zarr/h`: `(N, C, L+1, T, D)`
+- `enc_mc_res_embed.zarr/x`: `(N, C, T, D)`
+- `enc_mc_res_pre_attn.zarr/x`: `(N, C, L, T, D)`
+- `enc_mc_res_post_attn.zarr/x`: `(N, C, L, T, D)`
+- `enc_mc_res_post_mlp.zarr/x`: `(N, C, L, T, D)`
 
+## Python API (TraceStore)
+
+```python
 from pathlib import Path
-from src.traces.store import TraceStore
-import numpy as np
+from src.traces_utils.store import TraceStore
 
-# Load latest run
 run_dir = str(sorted(Path("traces").iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[0])
 st = TraceStore(run_dir)
 
-print(st.arrays())      # dict: name -> shape
-print(st.meta)          # run metadata
-print(st.tokens.head()) # example_id, text, ids, masks, tokens
+print(st.meta)
+print(st.arrays())
+print(st.tokens.head())
 
 eid = st.tokens.iloc[0]["example_id"]
+```
 
-# Encoder
-A_enc = st.attn(eid, side="enc", layer=0, head=0)           # (T_enc, T_enc)
-Q_enc = st.qkv(eid, "q", side="enc", layer=0, head=0)       # (T_enc, d_head)
-H_enc = st.hidden(eid, side="enc")                          # (L+1, T_enc, D) if captured
+### Decoder accessors
 
-# Decoder (GPT-2)
-A_dec = st.attn(eid, side="dec", layer=0, head=0)           # (T_dec, T_dec)
-K_dec = st.qkv(eid, "k", side="dec", layer=0, head=0)       # (T_dec, d_head)
+```python
+A = st.attn(eid, side="dec", kind="self", layer=0, head=0)       # (T, T)
+Q = st.qkv(eid, which="q", side="dec", kind="self", layer=0, head=0)  # (T, d)
+H = st.hidden(eid, side="dec")                                    # (L+1, T, D)
+R = st.resid(eid, stage="post_mlp", side="dec", layer=0)          # (T, D)
+```
 
-# Encoder–decoder (T5)
-A_es  = st.attn(eid, side="enc", kind="self",  layer=0, head=0)  # (T_enc, T_enc)
-A_ds  = st.attn(eid, side="dec", kind="self",  layer=0, head=0)  # (T_dec, T_dec) if targets
-A_x   = st.attn(eid, side="dec", kind="cross", layer=0, head=0)  # (T_dec, T_enc) if targets
-Q_x   = st.qkv(eid, "q", side="dec", kind="cross", layer=0, head=0)
-K_x   = st.qkv(eid, "k", side="dec", kind="cross", layer=0, head=0)
+### Encoder MCQ accessors
 
+```python
+choice_idx = int(st.tokens.iloc[0]["pred_idx"])
 
-Commands (copy/paste)
-
-# GPT 2 every trace csqa dataset 
-python -m src.cli.extract_trace_csqa_gpt 
---split validation 
---batch_size 8 
---max_seq_len auto 
---capture attn qkv hidden resid
-
-# RoBERTa, 32 samples, all layers/heads
-python -m src.cli.extract_traces --model roberta-base --dataset ud_ewt --split validation --limit 32 --max_seq_len 128 --capture attn qkv
-
-# GPT-2, 16 samples, selected layers/heads
-python -m src.cli.extract_traces --model gpt2 --dataset ud_ewt --split validation --limit 16 --max_seq_len 128 --capture attn qkv --layers-dec "0,5,11" --heads-dec "0,1,7"
-
-# T5 encoder-only, 12 samples (invalid indices auto-dropped)
-python -m src.cli.extract_traces --model t5-small --dataset ud_ewt --split validation --limit 12 --max_seq_len 128 --capture attn qkv hidden --layers-enc "0,5,11" --heads-enc "0,2,6"
-
-# T5 with decoder & cross (needs targets)
-python -m src.cli.extract_traces --model t5-small --dataset ud_ewt --split validation --limit 12 --max_seq_len 128 --dec_max_len 64 --targets_file data/targets_dummy.txt --capture attn qkv hidden --layers-enc '0,3,5' --heads-enc '0,2,6' --layers-dec '0,3,5' --heads-dec '0,2,6'
+A_mc = st.mcq_attn(eid, choice_idx=choice_idx, layer=0, head=0)          # (T, T)
+Q_mc = st.mcq_qkv(eid, choice_idx=choice_idx, which="q", layer=0, head=0) # (T, d)
+H_mc = st.mcq_hidden(eid, choice_idx=choice_idx)                           # (L+1, T, D)
+R_mc = st.mcq_resid(eid, choice_idx=choice_idx, stage="post_mlp", layer=0) # (T, D)
+```

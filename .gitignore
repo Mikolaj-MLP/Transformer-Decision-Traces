@@ -41,7 +41,6 @@ htmlcov/
 .cache/
 
 # Project data & artifacts (generated)
-data/
 !data/.gitkeep
 
 models/hf_cache/

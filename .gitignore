@@ -36,11 +36,11 @@ Thumbs.db
 coverage.xml
 htmlcov/
 
-# Hugging Face / caches (repo-local)
+# Hugging Face / caches 
 .huggingface/
 .cache/
 
-# Project data & artifacts (generated)
+# Project data & artifacts 
 !data/.gitkeep
 
 models/hf_cache/

@@ -45,7 +45,7 @@ htmlcov/
 
 models/hf_cache/
 models/checkpoints/
-
+tools/
 traces/
 !traces/.gitkeep
 

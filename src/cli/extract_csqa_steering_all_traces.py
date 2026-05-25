@@ -267,19 +267,20 @@ def extract_clean_baseline(
         predicted_choice_idx_cpu = metrics["predicted_choice_idx"].detach().cpu().numpy().astype(np.int64)
         is_correct_cpu = metrics["is_correct"].detach().cpu().numpy()
         best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
+        masked_logits = full_logits.clone()
+        masked_logits[:, answer_id_tensor.to(full_logits.device)] = -torch.inf
+        best_non_choice_token_id_cpu = (
+            torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
+        )
 
         for batch_index, row in batch_df.iterrows():
-            pred_idx = int(predicted_choice_idx_cpu[batch_index])
             true_idx = int(true_choice_idx[batch_index].item())
             baseline_rows.append(
                 {
                     "example_id": row["example_id"],
                     "split": split_name,
                     "true_choice_idx": true_idx,
-                    "true_choice_letter": LETTERS[true_idx],
-                    "clean_predicted_choice_idx": pred_idx,
-                    "clean_predicted_choice_letter": LETTERS[pred_idx],
-                    "clean_is_correct": bool(is_correct_cpu[batch_index]),
+                    "clean_best_non_choice_token_id": int(best_non_choice_token_id_cpu[batch_index]),
                     "clean_best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
                     "clean_logit_A": float(choice_logits_cpu[batch_index, 0]),
                     "clean_logit_B": float(choice_logits_cpu[batch_index, 1]),
@@ -407,7 +408,6 @@ def run_steering_scan(
     batch_size: int,
     steering_scales: list[float],
     steering_directions: dict[tuple[int, str], torch.Tensor],
-    baseline_lookup: dict[str, dict[str, object]],
 ) -> pd.DataFrame:
     result_rows: list[dict[str, object]] = []
     method_names = ["contrastive_mean_direction", "probe_normal_direction"]
@@ -431,9 +431,32 @@ def run_steering_scan(
                         dtype=torch.long,
                         device=input_device,
                     )
+                    steering_stats: dict[str, np.ndarray] = {}
 
                     def steering_hook(module, inputs, output):
                         hidden = unpack_output_hidden(output)
+                        row_idx = torch.arange(hidden.shape[0], device=hidden.device)
+                        token_hidden = hidden[row_idx, decision_pos]
+                        token_hidden_float = token_hidden.float()
+                        token_hidden_rms = token_hidden_float.pow(2).mean(dim=-1).sqrt()
+                        token_hidden_l2_norm = token_hidden_float.norm(dim=-1)
+                        direction_device = direction.to(hidden.device, dtype=hidden.dtype)
+                        direction_l2_norm = direction_device.float().norm()
+                        delta_l2_norm = float(steering_scale) * token_hidden_rms * direction_l2_norm
+                        delta_over_token_hidden_l2 = delta_l2_norm / token_hidden_l2_norm.clamp_min(1e-12)
+
+                        steering_stats["token_hidden_rms"] = token_hidden_rms.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["token_hidden_l2_norm"] = token_hidden_l2_norm.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["direction_l2_norm"] = np.full(
+                            hidden.shape[0],
+                            float(direction_l2_norm.item()),
+                            dtype=np.float32,
+                        )
+                        steering_stats["delta_l2_norm"] = delta_l2_norm.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["delta_over_token_hidden_l2"] = (
+                            delta_over_token_hidden_l2.detach().cpu().numpy().astype(np.float32)
+                        )
+
                         hidden = apply_token_steering(hidden, decision_pos, direction, float(steering_scale))
                         return repack_output_hidden(output, hidden)
 
@@ -448,30 +471,29 @@ def run_steering_scan(
                     metrics = summarize_decision_logits(full_logits, true_choice_idx, answer_id_tensor.to(full_logits.device))
 
                     choice_logits_cpu = metrics["choice_logits"].detach().cpu().numpy().astype(np.float32)
-                    predicted_choice_idx_cpu = metrics["predicted_choice_idx"].detach().cpu().numpy().astype(np.int64)
-                    is_correct_cpu = metrics["is_correct"].detach().cpu().numpy()
                     best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
+                    masked_logits = full_logits.clone()
+                    masked_logits[:, answer_id_tensor.to(full_logits.device)] = -torch.inf
+                    best_non_choice_token_id_cpu = (
+                        torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
+                    )
 
                     for batch_index, row in batch_df.iterrows():
                         example_id = row["example_id"]
-                        clean = baseline_lookup[example_id]
-                        pred_idx = int(predicted_choice_idx_cpu[batch_index])
-                        steered_is_correct = bool(is_correct_cpu[batch_index])
-                        clean_is_correct = bool(clean["clean_is_correct"])
-                        clean_pred_idx = int(clean["clean_predicted_choice_idx"])
-
                         result_rows.append(
                             {
                                 "example_id": example_id,
                                 "method": method_name,
                                 "layer_number": layer_number,
                                 "scale": float(steering_scale),
-                                "steered_predicted_choice_idx": pred_idx,
-                                "steered_predicted_choice_letter": LETTERS[pred_idx],
-                                "steered_is_correct": steered_is_correct,
-                                "prediction_changed": bool(pred_idx != clean_pred_idx),
-                                "rescued_error": bool((not clean_is_correct) and steered_is_correct),
-                                "harmed_correct": bool(clean_is_correct and (not steered_is_correct)),
+                                "token_hidden_rms": float(steering_stats["token_hidden_rms"][batch_index]),
+                                "token_hidden_l2_norm": float(steering_stats["token_hidden_l2_norm"][batch_index]),
+                                "direction_l2_norm": float(steering_stats["direction_l2_norm"][batch_index]),
+                                "delta_l2_norm": float(steering_stats["delta_l2_norm"][batch_index]),
+                                "delta_over_token_hidden_l2": float(
+                                    steering_stats["delta_over_token_hidden_l2"][batch_index]
+                                ),
+                                "steered_best_non_choice_token_id": int(best_non_choice_token_id_cpu[batch_index]),
                                 "steered_best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
                                 "steered_logit_A": float(choice_logits_cpu[batch_index, 0]),
                                 "steered_logit_B": float(choice_logits_cpu[batch_index, 1]),
@@ -498,7 +520,7 @@ def main() -> None:
     probe_train_epochs = 100
     probe_train_learning_rate = 5e-2
     probe_train_weight_decay = 1e-4
-    steering_scales = [1.5, 3.0]
+    steering_scales = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0]
     train_split = "train"
     target_split = "validation"
 
@@ -581,7 +603,6 @@ def main() -> None:
         batch_size=steering_batch_size,
         steering_scales=steering_scales,
         steering_directions=steering_directions,
-        baseline_lookup=baseline_lookup,
     )
 
     output_dir = resolve_out_dir(args.out_dir, args.model_id)

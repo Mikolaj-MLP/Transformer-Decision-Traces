@@ -414,43 +414,17 @@ def main() -> None:
                 best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
 
                 choice_logits = final_logits.index_select(1, answer_id_tensor_cpu)
-                true_choice_idx_batch_cpu = torch.tensor(batch_df["correct_idx"].tolist(), dtype=torch.long)
-                true_choice_logit_gap = true_choice_logit_minus_best_other_choice_logit(
-                    choice_logits,
-                    true_choice_idx_batch_cpu,
-                )
-                choice_probs = torch.softmax(choice_logits, dim=-1)
-                choice_pred_idx = choice_logits.argmax(dim=-1)
-
                 for batch_index, row in batch_df.iterrows():
                     final_output_rows.append(
                         {
                             "example_id": row["example_id"],
                             "true_choice_idx": int(row["correct_idx"]),
-                            "true_choice_letter": LETTERS[int(row["correct_idx"])],
-                            "clean_predicted_choice_idx": int(choice_pred_idx[batch_index].item()),
-                            "clean_predicted_choice_letter": LETTERS[int(choice_pred_idx[batch_index].item())],
-                            "clean_is_correct": bool(int(choice_pred_idx[batch_index].item()) == int(row["correct_idx"])),
-                            "clean_true_answer_probability_within_choices": float(
-                                choice_probs[batch_index, int(row["correct_idx"])].item()
-                            ),
-                            "clean_true_answer_rank_within_choices": int(
-                                1
-                                + (
-                                    choice_logits[batch_index]
-                                    > choice_logits[batch_index, int(row["correct_idx"])]
-                                ).sum().item()
-                            ),
-                            "clean_true_answer_logit_minus_best_other_choice_logit": float(
-                                true_choice_logit_gap[batch_index].item()
-                            ),
                             "clean_logit_A": float(choice_logits[batch_index, 0].item()),
                             "clean_logit_B": float(choice_logits[batch_index, 1].item()),
                             "clean_logit_C": float(choice_logits[batch_index, 2].item()),
                             "clean_logit_D": float(choice_logits[batch_index, 3].item()),
                             "clean_logit_E": float(choice_logits[batch_index, 4].item()),
                             "best_non_choice_token_id": int(best_non_choice_token_id[batch_index].item()),
-                            "best_non_choice_token_str": tok.convert_ids_to_tokens([int(best_non_choice_token_id[batch_index].item())])[0],
                             "best_non_choice_logit": float(best_non_choice_logit[batch_index].item()),
                         }
                     )
@@ -462,7 +436,6 @@ def main() -> None:
                                 "example_id": row["example_id"],
                                 "rank": rank_index + 1,
                                 "token_id": token_id,
-                                "token_str": tok.convert_ids_to_tokens([token_id])[0],
                                 "logit": float(topk_values[batch_index, rank_index].item()),
                                 "probability": float(final_probs[batch_index, token_id].item()),
                             }
@@ -595,39 +568,20 @@ def main() -> None:
                     if abs_end > abs_start:
                         choice_mass_by_head[:, choice_index] = attn_row_full[:, abs_start:abs_end].sum(axis=1)
 
-                aggregated_choice_mass = choice_mass_by_head.mean(axis=0)
-                if aggregated_choice_mass.sum() <= 0:
-                    aggregated_choice_probs = np.full(len(LETTERS), 1.0 / len(LETTERS), dtype=np.float32)
-                else:
-                    aggregated_choice_probs = aggregated_choice_mass / aggregated_choice_mass.sum()
-
-                sorted_choice_probs = np.sort(aggregated_choice_probs)[::-1]
-                attention_choice_predicted_choice_idx = int(np.argmax(aggregated_choice_probs))
-
-                attention_rows.append(
-                    {
-                        "example_id": example_id,
-                        "layer_number": layer_index + 1,
-                        "mean_head_renyi2_entropy_normalized": float(np.mean(head_renyi2_entropy)),
-                        "aggregated_choice_attention_entropy_normalized": float(
-                            -(
-                                aggregated_choice_probs
-                                * np.log(np.clip(aggregated_choice_probs, 1e-12, None))
-                            ).sum()
-                            / math.log(len(LETTERS))
-                        ),
-                        "aggregated_choice_attention_top1_top2_probability_gap": float(
-                            sorted_choice_probs[0] - sorted_choice_probs[1]
-                        ),
-                        "attention_choice_predicted_choice_idx": attention_choice_predicted_choice_idx,
-                        "attention_choice_predicted_choice_letter": LETTERS[attention_choice_predicted_choice_idx],
-                        "attention_choice_probability_A": float(aggregated_choice_probs[0]),
-                        "attention_choice_probability_B": float(aggregated_choice_probs[1]),
-                        "attention_choice_probability_C": float(aggregated_choice_probs[2]),
-                        "attention_choice_probability_D": float(aggregated_choice_probs[3]),
-                        "attention_choice_probability_E": float(aggregated_choice_probs[4]),
-                    }
-                )
+                for head_index in range(choice_mass_by_head.shape[0]):
+                    attention_rows.append(
+                        {
+                            "example_id": example_id,
+                            "layer_number": layer_index + 1,
+                            "head_number": head_index + 1,
+                            "head_renyi2_entropy_normalized": float(head_renyi2_entropy[head_index]),
+                            "attention_choice_mass_A": float(choice_mass_by_head[head_index, 0]),
+                            "attention_choice_mass_B": float(choice_mass_by_head[head_index, 1]),
+                            "attention_choice_mass_C": float(choice_mass_by_head[head_index, 2]),
+                            "attention_choice_mass_D": float(choice_mass_by_head[head_index, 3]),
+                            "attention_choice_mass_E": float(choice_mass_by_head[head_index, 4]),
+                        }
+                    )
 
     attention_outputs_df = pd.DataFrame(attention_rows)
 
@@ -715,39 +669,8 @@ def main() -> None:
                                 "layer_number": layer_index + 1,
                                 "substep_name": substep_name,
                                 "true_choice_idx": int(row["correct_idx"]),
-                                "true_choice_letter": LETTERS[int(row["correct_idx"])],
-                                "predicted_choice_idx": int(metrics["predicted_choice_idx"][batch_index].item()),
-                                "predicted_choice_letter": LETTERS[int(metrics["predicted_choice_idx"][batch_index].item())],
-                                "predicted_choice_is_correct": bool(metrics["predicted_choice_is_correct"][batch_index].item()),
-                                "predicted_vocab_token_id": int(metrics["predicted_vocab_token_id"][batch_index].item()),
                                 "best_non_choice_token_id": int(metrics["best_non_choice_token_id"][batch_index].item()),
                                 "best_non_choice_logit": float(metrics["best_non_choice_logit"][batch_index].item()),
-                                "best_choice_minus_best_non_choice_logit": float(
-                                    metrics["best_choice_minus_best_non_choice_logit"][batch_index].item()
-                                ),
-                                "full_vocab_entropy": float(metrics["full_vocab_entropy"][batch_index].item()),
-                                "full_vocab_entropy_normalized": float(
-                                    metrics["full_vocab_entropy"][batch_index].item()
-                                    / math.log(int(lm_head_weight.shape[0]))
-                                ),
-                                "answer_choice_entropy": float(metrics["answer_choice_entropy"][batch_index].item()),
-                                "answer_choice_entropy_normalized": float(
-                                    metrics["answer_choice_entropy"][batch_index].item()
-                                    / math.log(len(LETTERS))
-                                ),
-                                "answer_choice_top1_top2_logit_gap": float(
-                                    metrics["answer_choice_top1_top2_logit_gap"][batch_index].item()
-                                ),
-                                "true_answer_logit_minus_best_other_choice_logit": float(
-                                    metrics["true_answer_logit_minus_best_other_choice_logit"][batch_index].item()
-                                ),
-                                "true_answer_probability_within_choices": float(
-                                    metrics["true_answer_probability_within_choices"][batch_index].item()
-                                ),
-                                "true_answer_rank_within_choices": int(
-                                    metrics["true_answer_rank_within_choices"][batch_index].item()
-                                ),
-                                "choice_kl_to_final": float(metrics["choice_kl_to_final"][batch_index].item()),
                                 "logit_A": float(metrics["logit_A"][batch_index].item()),
                                 "logit_B": float(metrics["logit_B"][batch_index].item()),
                                 "logit_C": float(metrics["logit_C"][batch_index].item()),
@@ -780,50 +703,15 @@ def main() -> None:
                     readout.to(lm_head_weight.dtype),
                     lm_head_weight.T,
                 ).float()
-                full_log_probs = torch.log_softmax(full_logits, dim=-1)
-                full_probs = torch.exp(full_log_probs)
-                full_entropy = -(full_probs * full_log_probs).sum(dim=-1)
-                predicted_vocab_token_id = torch.argmax(full_logits, dim=-1)
-
                 masked_logits = full_logits.clone()
                 masked_logits[:, answer_id_tensor_lm_head] = -torch.inf
                 best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
 
                 choice_logits = full_logits.index_select(1, answer_id_tensor_lm_head)
-                choice_log_probs = torch.log_softmax(choice_logits, dim=-1)
-                choice_probs = torch.exp(choice_log_probs)
-                predicted_choice_index = torch.argmax(choice_logits, dim=-1)
-                sorted_choice_logits = torch.sort(choice_logits, dim=-1, descending=True).values
-                choice_gap = sorted_choice_logits[:, 0] - sorted_choice_logits[:, 1]
-                true_choice_idx_batch = torch.tensor(true_choice_idx_eval[start:stop], dtype=torch.long, device=train_device)
-                true_choice_prob = choice_probs[torch.arange(stop - start, device=train_device), true_choice_idx_batch]
-                true_choice_rank = 1 + (choice_logits > choice_logits[torch.arange(stop - start, device=train_device), true_choice_idx_batch][:, None]).sum(dim=-1)
-                true_choice_gap = true_choice_logit_minus_best_other_choice_logit(
-                    choice_logits,
-                    true_choice_idx_batch,
-                )
-                choice_kl_to_final = torch.sum(
-                    torch.as_tensor(final_choice_probs_eval[start:stop], device=train_device)
-                    * (
-                        torch.log(torch.clamp(torch.as_tensor(final_choice_probs_eval[start:stop], device=train_device), min=1e-12))
-                        - choice_log_probs
-                    ),
-                    dim=-1,
-                )
-                choice_entropy = -(choice_probs * choice_log_probs).sum(dim=-1)
 
                 choice_logits_cpu = choice_logits.detach().cpu().numpy().astype(np.float32)
-                full_entropy_cpu = full_entropy.detach().cpu().numpy().astype(np.float32)
-                choice_entropy_cpu = choice_entropy.detach().cpu().numpy().astype(np.float32)
-                choice_gap_cpu = choice_gap.detach().cpu().numpy().astype(np.float32)
-                true_choice_gap_cpu = true_choice_gap.detach().cpu().numpy().astype(np.float32)
-                true_choice_prob_cpu = true_choice_prob.detach().cpu().numpy().astype(np.float32)
-                true_choice_rank_cpu = true_choice_rank.detach().cpu().numpy().astype(np.int64)
-                predicted_choice_cpu = predicted_choice_index.detach().cpu().numpy().astype(np.int64)
-                predicted_vocab_token_cpu = predicted_vocab_token_id.detach().cpu().numpy().astype(np.int64)
                 best_non_choice_id_cpu = best_non_choice_token_id.detach().cpu().numpy().astype(np.int64)
                 best_non_choice_logit_cpu = best_non_choice_logit.detach().cpu().numpy().astype(np.float32)
-                choice_kl_to_final_cpu = choice_kl_to_final.detach().cpu().numpy().astype(np.float32)
 
                 for batch_index, example_index in enumerate(range(start, stop)):
                     layerwise_rows.append(
@@ -832,30 +720,8 @@ def main() -> None:
                             "layer_number": layer_index + 1,
                             "readout_method": method_name,
                             "true_choice_idx": int(true_choice_idx_eval[example_index]),
-                            "true_choice_letter": LETTERS[int(true_choice_idx_eval[example_index])],
-                            "predicted_choice_idx": int(predicted_choice_cpu[batch_index]),
-                            "predicted_choice_letter": LETTERS[int(predicted_choice_cpu[batch_index])],
-                            "predicted_choice_is_correct": bool(
-                                int(predicted_choice_cpu[batch_index]) == int(true_choice_idx_eval[example_index])
-                            ),
-                            "predicted_vocab_token_id": int(predicted_vocab_token_cpu[batch_index]),
                             "best_non_choice_token_id": int(best_non_choice_id_cpu[batch_index]),
                             "best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
-                            "full_vocab_entropy": float(full_entropy_cpu[batch_index]),
-                            "full_vocab_entropy_normalized": float(
-                                full_entropy_cpu[batch_index] / math.log(int(lm_head_weight.shape[0]))
-                            ),
-                            "answer_choice_entropy": float(choice_entropy_cpu[batch_index]),
-                            "answer_choice_entropy_normalized": float(
-                                choice_entropy_cpu[batch_index] / math.log(len(LETTERS))
-                            ),
-                            "answer_choice_top1_top2_logit_gap": float(choice_gap_cpu[batch_index]),
-                            "true_answer_logit_minus_best_other_choice_logit": float(
-                                true_choice_gap_cpu[batch_index]
-                            ),
-                            "true_answer_probability_within_choices": float(true_choice_prob_cpu[batch_index]),
-                            "true_answer_rank_within_choices": int(true_choice_rank_cpu[batch_index]),
-                            "choice_kl_to_final": float(choice_kl_to_final_cpu[batch_index]),
                             "logit_A": float(choice_logits_cpu[batch_index, 0]),
                             "logit_B": float(choice_logits_cpu[batch_index, 1]),
                             "logit_C": float(choice_logits_cpu[batch_index, 2]),
@@ -916,8 +782,8 @@ def main() -> None:
         "model_dtype": str(model_dtype),
         "last_layer_needs_final_norm": bool(last_layer_needs_final_norm),
         "tuned_lens_target": "final_answer_choice_distribution",
-        "attention_target": "decision_position_compact_choice_attention_summaries",
-        "substep_target": "decision_position_compact_substep_readouts",
+        "attention_target": "decision_position_per_head_choice_attention_masses_plus_head_entropy",
+        "substep_target": "decision_position_raw_substep_choice_readouts",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with (tmp_dir / "run_config.json").open("w", encoding="utf-8") as f:

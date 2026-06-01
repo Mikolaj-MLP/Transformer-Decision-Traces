@@ -36,6 +36,7 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 LETTERS = ["A", "B", "C", "D", "E"]
 EXTRACT_BATCH_SIZE = 4
 ATTENTION_BATCH_SIZE = 1
+READOUT_BATCH_SIZE = 64
 TUNED_LENS_BATCH_SIZE = 64
 TUNED_LENS_EPOCHS = 2
 TUNED_LENS_LR = 1e-3
@@ -287,59 +288,76 @@ def build_layerwise_readout_table(
 ) -> pd.DataFrame:
     hidden = cache["hidden"]
     example_rows = cache["example_rows"]
-    row_meta = pd.DataFrame(example_rows)[["example_id", "split", "correct_idx"]]
+    row_meta_records = pd.DataFrame(example_rows)[["example_id", "split", "correct_idx"]].to_dict("records")
     rows: list[dict[str, object]] = []
 
     for layer_index in tqdm(range(hidden.shape[1]), desc=f"{split_name} layerwise readouts"):
         layer_hidden = hidden[:, layer_index, :]
 
         for readout_method in ["direct_readout", "tuned_lens"]:
-            if readout_method == "direct_readout":
-                readout = maybe_apply_final_norm(layer_hidden.to(input_device).float(), layer_index)
-            else:
-                lens = lenses[layer_index]
-                if lens is None:
-                    readout = layer_hidden.to(input_device).float()
-                    if final_norm is not None:
-                        readout = final_norm(readout)
+            lens = lenses[layer_index]
+            if readout_method == "tuned_lens" and lens is not None:
+                lens = lens.to(input_device)
+
+            for start in range(0, layer_hidden.shape[0], READOUT_BATCH_SIZE):
+                end = start + READOUT_BATCH_SIZE
+                hidden_batch = layer_hidden[start:end].to(input_device).float()
+
+                if readout_method == "direct_readout":
+                    readout = maybe_apply_final_norm(hidden_batch, layer_index)
                 else:
-                    lens = lens.to(input_device)
-                    with torch.inference_mode():
-                        readout = lens(layer_hidden.to(input_device).float())
-                    if final_norm is not None:
-                        readout = final_norm(readout)
-                    lens = lens.cpu()
+                    if lens is None:
+                        readout = hidden_batch
+                        if final_norm is not None:
+                            readout = final_norm(readout)
+                    else:
+                        with torch.inference_mode():
+                            readout = lens(hidden_batch)
+                        if final_norm is not None:
+                            readout = final_norm(readout)
 
-            full_logits = torch.matmul(
-                readout.to(lm_head_weight.dtype),
-                lm_head_weight.T,
-            ).float()
-            masked_logits = full_logits.clone()
-            masked_logits[:, answer_id_tensor_lm_head] = -torch.inf
-            best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
-            choice_logits = full_logits.index_select(1, answer_id_tensor_lm_head)
+                full_logits = torch.matmul(
+                    readout.to(lm_head_weight.dtype),
+                    lm_head_weight.T,
+                ).float()
+                masked_logits = full_logits.clone()
+                masked_logits[:, answer_id_tensor_lm_head] = -torch.inf
+                best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
+                choice_logits = full_logits.index_select(1, answer_id_tensor_lm_head)
 
-            choice_logits_cpu = choice_logits.detach().cpu().numpy().astype(np.float32)
-            best_non_choice_logit_cpu = best_non_choice_logit.detach().cpu().numpy().astype(np.float32)
-            best_non_choice_token_id_cpu = best_non_choice_token_id.detach().cpu().numpy().astype(np.int64)
+                choice_logits_cpu = choice_logits.detach().cpu().numpy().astype(np.float32)
+                best_non_choice_logit_cpu = best_non_choice_logit.detach().cpu().numpy().astype(np.float32)
+                best_non_choice_token_id_cpu = best_non_choice_token_id.detach().cpu().numpy().astype(np.int64)
 
-            for row_index, meta in row_meta.iterrows():
-                rows.append(
-                    {
-                        "example_id": meta["example_id"],
-                        "split": meta["split"],
-                        "layer_number": layer_index + 1,
-                        "readout_method": readout_method,
-                        "true_choice_idx": int(meta["correct_idx"]),
-                        "best_non_choice_token_id": int(best_non_choice_token_id_cpu[row_index]),
-                        "best_non_choice_logit": float(best_non_choice_logit_cpu[row_index]),
-                        "logit_A": float(choice_logits_cpu[row_index, 0]),
-                        "logit_B": float(choice_logits_cpu[row_index, 1]),
-                        "logit_C": float(choice_logits_cpu[row_index, 2]),
-                        "logit_D": float(choice_logits_cpu[row_index, 3]),
-                        "logit_E": float(choice_logits_cpu[row_index, 4]),
-                    }
-                )
+                for local_index, global_index in enumerate(range(start, min(end, layer_hidden.shape[0]))):
+                    meta = row_meta_records[global_index]
+                    rows.append(
+                        {
+                            "example_id": meta["example_id"],
+                            "split": meta["split"],
+                            "layer_number": layer_index + 1,
+                            "readout_method": readout_method,
+                            "true_choice_idx": int(meta["correct_idx"]),
+                            "best_non_choice_token_id": int(best_non_choice_token_id_cpu[local_index]),
+                            "best_non_choice_logit": float(best_non_choice_logit_cpu[local_index]),
+                            "logit_A": float(choice_logits_cpu[local_index, 0]),
+                            "logit_B": float(choice_logits_cpu[local_index, 1]),
+                            "logit_C": float(choice_logits_cpu[local_index, 2]),
+                            "logit_D": float(choice_logits_cpu[local_index, 3]),
+                            "logit_E": float(choice_logits_cpu[local_index, 4]),
+                        }
+                    )
+
+                del hidden_batch
+                del readout
+                del full_logits
+                del masked_logits
+                del best_non_choice_logit
+                del best_non_choice_token_id
+                del choice_logits
+
+            if readout_method == "tuned_lens" and lens is not None:
+                lens = lens.cpu()
 
         gc.collect()
         if torch.cuda.is_available():
@@ -564,6 +582,7 @@ def main() -> None:
         "hidden_size": int(hidden_size),
         "extract_batch_size": EXTRACT_BATCH_SIZE,
         "attention_batch_size": ATTENTION_BATCH_SIZE,
+        "readout_batch_size": READOUT_BATCH_SIZE,
         "tuned_lens_batch_size": TUNED_LENS_BATCH_SIZE,
         "tuned_lens_epochs": TUNED_LENS_EPOCHS,
         "tuned_lens_lr": TUNED_LENS_LR,

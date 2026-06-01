@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -62,6 +63,7 @@ def parse_scales(raw: str) -> list[float]:
     return values
 
 
+
 def run_contrastive_scale_sweep(
     frame: pd.DataFrame,
     *,
@@ -77,96 +79,95 @@ def run_contrastive_scale_sweep(
 ) -> pd.DataFrame:
     result_rows: list[dict[str, object]] = []
     layer_numbers = list(range(1, len(decoder_layers) + 1))
+    total_batches = len(layer_numbers) * len(steering_scales) * int(math.ceil(len(frame) / batch_size))
 
-    for layer_number in layer_numbers:
-        steering_module = decoder_layers[layer_number - 1]
-        direction = contrastive_directions[layer_number]
+    with tqdm(total=total_batches, desc="contrastive scale sweep") as pbar:
+        for layer_number in layer_numbers:
+            steering_module = decoder_layers[layer_number - 1]
+            direction = contrastive_directions[layer_number]
 
-        for steering_scale in steering_scales:
-            for start in range(0, len(frame), batch_size):
-                batch_df = frame.iloc[start:start + batch_size].reset_index(drop=True)
-                batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, max_seq_len)
-                decision_pos = batch_cpu.pop("decision_pos")
-                batch = {k: v.to(input_device) for k, v in batch_cpu.items()}
-                decision_pos = decision_pos.to(input_device)
-                true_choice_idx = torch.tensor(
-                    [LETTERS.index(str(x)) for x in batch_df["answerKey"].tolist()],
-                    dtype=torch.long,
-                    device=input_device,
-                )
-                steering_stats: dict[str, np.ndarray] = {}
-
-                def steering_hook(module, inputs, output):
-                    hidden = unpack_output_hidden(output)
-                    row_idx = torch.arange(hidden.shape[0], device=hidden.device)
-                    token_hidden = hidden[row_idx, decision_pos]
-                    token_hidden_float = token_hidden.float()
-                    token_hidden_rms = token_hidden_float.pow(2).mean(dim=-1).sqrt()
-                    token_hidden_l2_norm = token_hidden_float.norm(dim=-1)
-                    direction_device = direction.to(hidden.device, dtype=hidden.dtype)
-                    direction_l2_norm = direction_device.float().norm()
-                    delta_l2_norm = float(steering_scale) * token_hidden_rms * direction_l2_norm
-                    delta_over_token_hidden_l2 = delta_l2_norm / token_hidden_l2_norm.clamp_min(1e-12)
-
-                    steering_stats["token_hidden_rms"] = token_hidden_rms.detach().cpu().numpy().astype(np.float32)
-                    steering_stats["token_hidden_l2_norm"] = token_hidden_l2_norm.detach().cpu().numpy().astype(np.float32)
-                    steering_stats["direction_l2_norm"] = np.full(
-                        hidden.shape[0],
-                        float(direction_l2_norm.item()),
-                        dtype=np.float32,
+            for steering_scale in steering_scales:
+                for start in range(0, len(frame), batch_size):
+                    batch_df = frame.iloc[start:start + batch_size].reset_index(drop=True)
+                    batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, max_seq_len)
+                    decision_pos = batch_cpu.pop("decision_pos")
+                    batch = {k: v.to(input_device) for k, v in batch_cpu.items()}
+                    decision_pos = decision_pos.to(input_device)
+                    true_choice_idx = torch.tensor(
+                        [LETTERS.index(str(x)) for x in batch_df["answerKey"].tolist()],
+                        dtype=torch.long,
+                        device=input_device,
                     )
-                    steering_stats["delta_l2_norm"] = delta_l2_norm.detach().cpu().numpy().astype(np.float32)
-                    steering_stats["delta_over_token_hidden_l2"] = (
-                        delta_over_token_hidden_l2.detach().cpu().numpy().astype(np.float32)
-                    )
+                    steering_stats: dict[str, np.ndarray] = {}
 
-                    hidden = apply_token_steering(hidden, decision_pos, direction, float(steering_scale))
-                    return repack_output_hidden(output, hidden)
+                    def steering_hook(module, inputs, output):
+                        hidden = unpack_output_hidden(output)
+                        row_idx = torch.arange(hidden.shape[0], device=hidden.device)
+                        token_hidden = hidden[row_idx, decision_pos]
+                        token_hidden_float = token_hidden.float()
+                        token_hidden_rms = token_hidden_float.pow(2).mean(dim=-1).sqrt()
+                        token_hidden_l2_norm = token_hidden_float.norm(dim=-1)
+                        direction_device = direction.to(hidden.device, dtype=hidden.dtype)
+                        direction_l2_norm = direction_device.float().norm()
+                        delta_l2_norm = float(steering_scale) * token_hidden_rms * direction_l2_norm
+                        delta_over_token_hidden_l2 = delta_l2_norm / token_hidden_l2_norm.clamp_min(1e-12)
 
-                handle = steering_module.register_forward_hook(steering_hook)
-                try:
-                    with torch.inference_mode():
-                        out = model(**batch, return_dict=True, use_cache=False)
-                finally:
-                    handle.remove()
+                        steering_stats["token_hidden_rms"] = token_hidden_rms.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["token_hidden_l2_norm"] = token_hidden_l2_norm.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["direction_l2_norm"] = np.full(
+                            hidden.shape[0],
+                            float(direction_l2_norm.item()),
+                            dtype=np.float32,
+                        )
+                        steering_stats["delta_l2_norm"] = delta_l2_norm.detach().cpu().numpy().astype(np.float32)
+                        steering_stats["delta_over_token_hidden_l2"] = (
+                            delta_over_token_hidden_l2.detach().cpu().numpy().astype(np.float32)
+                        )
 
-                full_logits = select_full_logits_at_decision(out.logits, decision_pos)
-                metrics = summarize_decision_logits(full_logits, true_choice_idx, answer_id_tensor.to(full_logits.device))
+                        hidden = apply_token_steering(hidden, decision_pos, direction, float(steering_scale))
+                        return repack_output_hidden(output, hidden)
 
-                choice_logits_cpu = metrics["choice_logits"].detach().cpu().numpy().astype(np.float32)
-                best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
-                masked_logits = full_logits.clone()
-                masked_logits[:, answer_id_tensor.to(full_logits.device)] = -torch.inf
-                best_non_choice_token_id_cpu = (
-                    torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
-                )
+                    handle = steering_module.register_forward_hook(steering_hook)
+                    try:
+                        with torch.inference_mode():
+                            out = model(**batch, return_dict=True, use_cache=False)
+                    finally:
+                        handle.remove()
 
-                for batch_index, row in batch_df.iterrows():
-                    result_rows.append(
-                        {
-                            "example_id": row["example_id"],
-                            "method": "contrastive_mean_direction",
-                            "layer_number": layer_number,
-                            "scale": float(steering_scale),
-                            "token_hidden_rms": float(steering_stats["token_hidden_rms"][batch_index]),
-                            "token_hidden_l2_norm": float(steering_stats["token_hidden_l2_norm"][batch_index]),
-                            "direction_l2_norm": float(steering_stats["direction_l2_norm"][batch_index]),
-                            "delta_l2_norm": float(steering_stats["delta_l2_norm"][batch_index]),
-                            "delta_over_token_hidden_l2": float(steering_stats["delta_over_token_hidden_l2"][batch_index]),
-                            "steered_best_non_choice_token_id": int(best_non_choice_token_id_cpu[batch_index]),
-                            "steered_best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
-                            "steered_logit_A": float(choice_logits_cpu[batch_index, 0]),
-                            "steered_logit_B": float(choice_logits_cpu[batch_index, 1]),
-                            "steered_logit_C": float(choice_logits_cpu[batch_index, 2]),
-                            "steered_logit_D": float(choice_logits_cpu[batch_index, 3]),
-                            "steered_logit_E": float(choice_logits_cpu[batch_index, 4]),
-                        }
+                    full_logits = select_full_logits_at_decision(out.logits, decision_pos)
+                    metrics = summarize_decision_logits(full_logits, true_choice_idx, answer_id_tensor.to(full_logits.device))
+
+                    choice_logits_cpu = metrics["choice_logits"].detach().cpu().numpy().astype(np.float32)
+                    best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
+                    masked_logits = full_logits.clone()
+                    masked_logits[:, answer_id_tensor.to(full_logits.device)] = -torch.inf
+                    best_non_choice_token_id_cpu = (
+                        torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
                     )
 
-                del out
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                    for batch_index, row in batch_df.iterrows():
+                        result_rows.append(
+                            {
+                                "example_id": row["example_id"],
+                                "method": "contrastive_mean_direction",
+                                "layer_number": layer_number,
+                                "scale": float(steering_scale),
+                                "token_hidden_rms": float(steering_stats["token_hidden_rms"][batch_index]),
+                                "token_hidden_l2_norm": float(steering_stats["token_hidden_l2_norm"][batch_index]),
+                                "direction_l2_norm": float(steering_stats["direction_l2_norm"][batch_index]),
+                                "delta_l2_norm": float(steering_stats["delta_l2_norm"][batch_index]),
+                                "delta_over_token_hidden_l2": float(steering_stats["delta_over_token_hidden_l2"][batch_index]),
+                                "steered_best_non_choice_token_id": int(best_non_choice_token_id_cpu[batch_index]),
+                                "steered_best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
+                                "steered_logit_A": float(choice_logits_cpu[batch_index, 0]),
+                                "steered_logit_B": float(choice_logits_cpu[batch_index, 1]),
+                                "steered_logit_C": float(choice_logits_cpu[batch_index, 2]),
+                                "steered_logit_D": float(choice_logits_cpu[batch_index, 3]),
+                                "steered_logit_E": float(choice_logits_cpu[batch_index, 4]),
+                            }
+                        )
+
+                    pbar.update(1)
 
     return pd.DataFrame(result_rows)
 

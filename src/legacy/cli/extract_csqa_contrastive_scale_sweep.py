@@ -16,12 +16,12 @@ import torch
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.data.load_csqa import load_csqa
-from src.cli.extract_csqa_steering_all_traces import (
+from src.legacy.cli.extract_csqa_steering_all_traces import (
     LETTERS,
     apply_token_steering,
     build_answer_token_ids,

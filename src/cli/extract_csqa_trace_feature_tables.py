@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.cli.extract_csqa_base_layerwise import (  # noqa: E402
+from src.csqa.common import (  # noqa: E402
     AffineTranslator,
     build_answer_token_ids,
     build_choice_token_spans,
@@ -38,7 +38,8 @@ EXTRACT_BATCH_SIZE = 4
 ATTENTION_BATCH_SIZE = 1
 READOUT_BATCH_SIZE = 64
 TUNED_LENS_BATCH_SIZE = 64
-TUNED_LENS_EPOCHS = 2
+TUNED_LENS_MAX_EPOCHS = 10
+TUNED_LENS_PATIENCE = 2
 TUNED_LENS_LR = 1e-3
 TUNED_LENS_WEIGHT_DECAY = 1e-5
 
@@ -237,7 +238,10 @@ def train_tuned_lenses(
         dataset = TensorDataset(train_hidden[:, layer_index, :], teacher_choice_probs_train)
         dataloader = DataLoader(dataset, batch_size=TUNED_LENS_BATCH_SIZE, shuffle=True)
 
-        for epoch in range(1, TUNED_LENS_EPOCHS + 1):
+        best_loss = float("inf")
+        epochs_without_improvement = 0
+
+        for epoch in range(1, TUNED_LENS_MAX_EPOCHS + 1):
             epoch_losses: list[float] = []
             lens.train()
             for xb, teacher_probs_b in dataloader:
@@ -255,13 +259,23 @@ def train_tuned_lenses(
                 optimizer.step()
                 epoch_losses.append(float(loss.item()))
 
+            mean_epoch_loss = float(np.mean(epoch_losses))
             train_history_rows.append(
                 {
                     "layer_number": layer_index + 1,
                     "epoch": epoch,
-                    "mean_kl_loss": float(np.mean(epoch_losses)),
+                    "mean_kl_loss": mean_epoch_loss,
                 }
             )
+
+            if mean_epoch_loss < (best_loss - 1e-6):
+                best_loss = mean_epoch_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= TUNED_LENS_PATIENCE:
+                break
 
         lens.eval()
         lens_cpu = lens.cpu()
@@ -307,9 +321,7 @@ def build_layerwise_readout_table(
                     readout = maybe_apply_final_norm(hidden_batch, layer_index)
                 else:
                     if lens is None:
-                        readout = hidden_batch
-                        if final_norm is not None:
-                            readout = final_norm(readout)
+                        readout = maybe_apply_final_norm(hidden_batch, layer_index)
                     else:
                         with torch.inference_mode():
                             readout = lens(hidden_batch)
@@ -584,7 +596,8 @@ def main() -> None:
         "attention_batch_size": ATTENTION_BATCH_SIZE,
         "readout_batch_size": READOUT_BATCH_SIZE,
         "tuned_lens_batch_size": TUNED_LENS_BATCH_SIZE,
-        "tuned_lens_epochs": TUNED_LENS_EPOCHS,
+        "tuned_lens_max_epochs": TUNED_LENS_MAX_EPOCHS,
+        "tuned_lens_patience": TUNED_LENS_PATIENCE,
         "tuned_lens_lr": TUNED_LENS_LR,
         "tuned_lens_weight_decay": TUNED_LENS_WEIGHT_DECAY,
         "layerwise_table": "layerwise_readouts.parquet",

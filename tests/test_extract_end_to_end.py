@@ -7,10 +7,10 @@ from unittest.mock import patch
 import pandas as pd
 from transformers import AutoConfig
 
-from src.cli import extract_trace_csqa_enc
-from src.cli import extract_trace_csqa_gpt
-from src.cli import extract_trace_nexttok_dec
-from src.cli import extract_traces
+from src.legacy.cli import extract_trace_csqa_enc
+from src.legacy.cli import extract_trace_csqa_gpt
+from src.legacy.cli import extract_trace_nexttok_dec
+from src.legacy.cli import extract_traces
 from src.traces_utils.store import TraceStore
 
 
@@ -61,7 +61,7 @@ class TestExtractScriptsEndToEnd(unittest.TestCase):
         csqa_df = make_csqa_df(3)
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td) / "csqa_gpt_run"
-            with patch("src.cli.extract_trace_csqa_gpt.load_csqa", return_value=csqa_df), patch(
+            with patch("src.legacy.cli.extract_trace_csqa_gpt.load_csqa", return_value=csqa_df), patch(
                 "sys.argv",
                 [
                     "extract_trace_csqa_gpt.py",
@@ -107,7 +107,7 @@ class TestExtractScriptsEndToEnd(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td) / "nexttok_run"
             with patch(
-                "src.cli.extract_trace_nexttok_dec.load_nexttok_texts", return_value=nexttok_df
+                "src.legacy.cli.extract_trace_nexttok_dec.load_nexttok_texts", return_value=nexttok_df
             ), patch(
                 "sys.argv",
                 [
@@ -149,7 +149,7 @@ class TestExtractScriptsEndToEnd(unittest.TestCase):
         csqa_df = make_csqa_df(2)
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td) / "enc_run"
-            with patch("src.cli.extract_trace_csqa_enc.load_csqa", return_value=csqa_df), patch(
+            with patch("src.legacy.cli.extract_trace_csqa_enc.load_csqa", return_value=csqa_df), patch(
                 "sys.argv",
                 [
                     "extract_trace_csqa_enc.py",
@@ -197,7 +197,7 @@ class TestExtractScriptsEndToEnd(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as td:
             out_dir = Path(td) / "generic_run"
-            with patch("src.cli.extract_traces.load_ud_ewt", return_value=ud_df), patch(
+            with patch("src.legacy.cli.extract_traces.load_ud_ewt", return_value=ud_df), patch(
                 "sys.argv",
                 [
                     "extract_traces.py",

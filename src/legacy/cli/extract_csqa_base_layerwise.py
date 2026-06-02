@@ -13,23 +13,15 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.cli.extract_csqa_base_layerwise import (
-    AffineTranslator,
-    build_answer_token_ids,
-    build_choice_token_spans,
-    encode_prompts,
-    get_decoder_layers,
-    get_final_norm_module,
-    true_choice_logit_minus_best_other_choice_logit,
-)
 from src.data.load_csqa import load_csqa
 
 
@@ -37,10 +29,20 @@ LETTERS = ["A", "B", "C", "D", "E"]
 EXTRACT_BATCH_SIZE = 4
 READOUT_BATCH_SIZE = 32
 ATTENTION_BATCH_SIZE = 1
+SUBSTEP_BATCH_SIZE = 1
 TUNED_LENS_BATCH_SIZE = 64
 TUNED_LENS_EPOCHS = 2
 TUNED_LENS_LR = 1e-3
 TUNED_LENS_WEIGHT_DECAY = 1e-5
+
+
+class AffineTranslator(nn.Module):
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
 
 
 def now_id() -> str:
@@ -58,10 +60,137 @@ def slugify_model_id(model_id: str) -> str:
 def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
     root = repo_root()
     if out_dir is None:
-        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_base_train_layerwise"
-        return root / "data" / "generated" / "csqa_base_train_layerwise" / run_name
+        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_base_layerwise"
+        return root / "data" / "generated" / "csqa_base_layerwise" / run_name
     path = Path(out_dir)
     return path if path.is_absolute() else (root / path)
+
+
+def get_final_norm_module(model: AutoModelForCausalLM):
+    candidates = [
+        "model.norm",
+        "model.final_layernorm",
+        "transformer.ln_f",
+        "gpt_neox.final_layer_norm",
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for part in path.split("."):
+            if not hasattr(current, part):
+                ok = False
+                break
+            current = getattr(current, part)
+        if ok:
+            return current
+    return None
+
+
+def get_decoder_layers(model: AutoModelForCausalLM):
+    candidates = [
+        "model.layers",
+        "transformer.h",
+        "gpt_neox.layers",
+    ]
+    for path in candidates:
+        current = model
+        ok = True
+        for part in path.split("."):
+            if not hasattr(current, part):
+                ok = False
+                break
+            current = getattr(current, part)
+        if ok:
+            return current
+    raise ValueError("Could not locate decoder layers on this model.")
+
+
+def get_post_attention_input_module(layer: nn.Module) -> nn.Module:
+    candidates = [
+        "post_attention_layernorm",
+        "ln_2",
+    ]
+    for name in candidates:
+        if hasattr(layer, name):
+            return getattr(layer, name)
+    raise ValueError("Could not locate post-attention input module on decoder layer.")
+
+
+def build_answer_token_ids(tok: AutoTokenizer) -> dict[str, int]:
+    answer_token_ids: dict[str, int] = {}
+    for letter in LETTERS:
+        ids = tok(" " + letter, add_special_tokens=False)["input_ids"]
+        if len(ids) != 1:
+            raise ValueError(f"Answer token '{letter}' is not single-token: {ids}")
+        answer_token_ids[letter] = int(ids[0])
+    return answer_token_ids
+
+
+def encode_prompts(texts: list[str], tok: AutoTokenizer, max_seq_len: int) -> dict[str, torch.Tensor]:
+    batch = tok(
+        list(texts),
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_seq_len,
+        padding=True,
+        return_tensors="pt",
+    )
+    decision_pos = []
+    prompt_token_count = []
+    for mask in batch["attention_mask"]:
+        nz = torch.nonzero(mask, as_tuple=False).view(-1)
+        prompt_token_count.append(int(nz.numel()))
+        decision_pos.append(int(nz[-1].item()))
+    batch["decision_pos"] = torch.tensor(decision_pos, dtype=torch.long)
+    batch["prompt_token_count"] = torch.tensor(prompt_token_count, dtype=torch.long)
+    return batch
+
+
+def build_choice_token_spans(
+    text: str,
+    tok: AutoTokenizer,
+    max_seq_len: int,
+) -> list[tuple[int, int]]:
+    lines = str(text).split("\n")
+    choice_lines = lines[2:7]
+    if len(choice_lines) != 5:
+        raise ValueError("Expected exactly 5 answer-choice lines.")
+
+    full_ids = tok(str(text), add_special_tokens=False)["input_ids"]
+    full_len = len(full_ids)
+    kept_len = min(full_len, max_seq_len)
+    left_trunc = max(0, full_len - max_seq_len)
+
+    spans: list[tuple[int, int]] = []
+    for choice_index in range(5):
+        prefix_text = "\n".join(lines[: 2 + choice_index]) + "\n"
+        end_text = "\n".join(lines[: 3 + choice_index])
+        start_full = len(tok(prefix_text, add_special_tokens=False)["input_ids"])
+        end_full = len(tok(end_text, add_special_tokens=False)["input_ids"])
+
+        start_kept = max(0, min(kept_len, start_full - left_trunc))
+        end_kept = max(0, min(kept_len, end_full - left_trunc))
+        spans.append((int(start_kept), int(end_kept)))
+
+    return spans
+
+
+def true_choice_logit_minus_best_other_choice_logit(
+    choice_logits: torch.Tensor,
+    true_choice_idx: torch.Tensor,
+) -> torch.Tensor:
+    row_idx = torch.arange(choice_logits.shape[0], device=choice_logits.device)
+    true_choice_logits = choice_logits[row_idx, true_choice_idx]
+    masked = choice_logits.clone()
+    masked[row_idx, true_choice_idx] = -torch.inf
+    best_other_choice_logits = torch.max(masked, dim=-1).values
+    return true_choice_logits - best_other_choice_logits
+
+
+def unpack_output_hidden(output: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    if isinstance(output, tuple):
+        return output[0]
+    return output
 
 
 def main() -> None:
@@ -69,6 +198,7 @@ def main() -> None:
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
+    parser.add_argument("--top-k-final", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -76,7 +206,10 @@ def main() -> None:
     np.random.seed(args.seed)
 
     train_rows = load_csqa(split="train", limit=None).copy()
-    train_rows["prompt_len_chars"] = train_rows["text"].str.len()
+    eval_rows = load_csqa(split="validation", limit=None).copy()
+
+    for frame in [train_rows, eval_rows]:
+        frame["prompt_len_chars"] = frame["text"].str.len()
 
     if torch.cuda.is_available():
         if torch.cuda.is_bf16_supported():
@@ -95,7 +228,7 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
-        dtype=model_dtype,
+        torch_dtype=model_dtype,
         device_map=device_map,
         attn_implementation="eager",
     )
@@ -116,7 +249,7 @@ def main() -> None:
     answer_id_tensor_lm_head = answer_id_tensor_cpu.to(lm_head_device)
     answer_choice_weight = lm_head_weight.index_select(0, answer_id_tensor_lm_head)
 
-    probe_cpu = encode_prompts(train_rows["text"].head(1).tolist(), tok, args.max_seq_len)
+    probe_cpu = encode_prompts(eval_rows["text"].head(1).tolist(), tok, args.max_seq_len)
     probe_pos = int(probe_cpu["decision_pos"][0].item())
     probe_batch = {k: v.to(input_device) for k, v in probe_cpu.items() if k not in ["decision_pos", "prompt_token_count"]}
     with torch.inference_mode():
@@ -196,6 +329,7 @@ def main() -> None:
             dim=-1,
         )
         choice_entropy = -(choice_probs * choice_log_probs).sum(dim=-1)
+        best_choice_logit = torch.max(choice_logits, dim=-1).values
 
         return {
             "predicted_choice_idx": predicted_choice_index,
@@ -203,6 +337,7 @@ def main() -> None:
             "predicted_vocab_token_id": predicted_vocab_token_id,
             "best_non_choice_token_id": best_non_choice_token_id,
             "best_non_choice_logit": best_non_choice_logit,
+            "best_choice_minus_best_non_choice_logit": best_choice_logit - best_non_choice_logit,
             "full_vocab_entropy": full_entropy,
             "answer_choice_entropy": choice_entropy,
             "answer_choice_top1_top2_logit_gap": choice_gap,
@@ -217,12 +352,13 @@ def main() -> None:
             "logit_E": choice_logits[:, 4],
         }
 
-    def extract_split_cache(frame: pd.DataFrame):
+    def extract_split_cache(frame: pd.DataFrame, capture_final_outputs: bool):
         hidden_blocks: list[torch.Tensor] = []
         final_choice_prob_blocks: list[torch.Tensor] = []
         true_choice_idx_blocks: list[torch.Tensor] = []
         example_rows: list[dict[str, object]] = []
         final_output_rows: list[dict[str, object]] = []
+        final_topk_rows: list[dict[str, object]] = []
 
         for start in range(0, len(frame), EXTRACT_BATCH_SIZE):
             batch_df = frame.iloc[start:start + EXTRACT_BATCH_SIZE].reset_index(drop=True)
@@ -267,26 +403,43 @@ def main() -> None:
                     }
                 )
 
-            final_logits = out.logits[row_idx, decision_pos].float().detach().cpu()
-            masked_logits = final_logits.clone()
-            masked_logits[:, answer_id_tensor_cpu] = -torch.inf
-            best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
+            if capture_final_outputs:
+                final_logits = out.logits[row_idx, decision_pos].float().detach().cpu()
+                final_log_probs = torch.log_softmax(final_logits, dim=-1)
+                final_probs = torch.exp(final_log_probs)
+                topk_values, topk_ids = torch.topk(final_logits, k=int(args.top_k_final), dim=-1)
 
-            choice_logits = final_logits.index_select(1, answer_id_tensor_cpu)
-            for batch_index, row in batch_df.iterrows():
-                final_output_rows.append(
-                    {
-                        "example_id": row["example_id"],
-                        "true_choice_idx": int(row["correct_idx"]),
-                        "clean_logit_A": float(choice_logits[batch_index, 0].item()),
-                        "clean_logit_B": float(choice_logits[batch_index, 1].item()),
-                        "clean_logit_C": float(choice_logits[batch_index, 2].item()),
-                        "clean_logit_D": float(choice_logits[batch_index, 3].item()),
-                        "clean_logit_E": float(choice_logits[batch_index, 4].item()),
-                        "best_non_choice_token_id": int(best_non_choice_token_id[batch_index].item()),
-                        "best_non_choice_logit": float(best_non_choice_logit[batch_index].item()),
-                    }
-                )
+                masked_logits = final_logits.clone()
+                masked_logits[:, answer_id_tensor_cpu] = -torch.inf
+                best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
+
+                choice_logits = final_logits.index_select(1, answer_id_tensor_cpu)
+                for batch_index, row in batch_df.iterrows():
+                    final_output_rows.append(
+                        {
+                            "example_id": row["example_id"],
+                            "true_choice_idx": int(row["correct_idx"]),
+                            "clean_logit_A": float(choice_logits[batch_index, 0].item()),
+                            "clean_logit_B": float(choice_logits[batch_index, 1].item()),
+                            "clean_logit_C": float(choice_logits[batch_index, 2].item()),
+                            "clean_logit_D": float(choice_logits[batch_index, 3].item()),
+                            "clean_logit_E": float(choice_logits[batch_index, 4].item()),
+                            "best_non_choice_token_id": int(best_non_choice_token_id[batch_index].item()),
+                            "best_non_choice_logit": float(best_non_choice_logit[batch_index].item()),
+                        }
+                    )
+
+                    for rank_index in range(int(args.top_k_final)):
+                        token_id = int(topk_ids[batch_index, rank_index].item())
+                        final_topk_rows.append(
+                            {
+                                "example_id": row["example_id"],
+                                "rank": rank_index + 1,
+                                "token_id": token_id,
+                                "logit": float(topk_values[batch_index, rank_index].item()),
+                                "probability": float(final_probs[batch_index, token_id].item()),
+                            }
+                        )
 
         return {
             "hidden": torch.cat(hidden_blocks, dim=0),
@@ -296,9 +449,10 @@ def main() -> None:
             "answerKey": frame["answerKey"].astype(str).tolist(),
             "example_rows": example_rows,
             "final_output_rows": final_output_rows,
+            "final_topk_rows": final_topk_rows,
         }
 
-    train_cache = extract_split_cache(train_rows)
+    train_cache = extract_split_cache(train_rows, capture_final_outputs=False)
     teacher_choice_probs_train = train_cache["final_choice_probs"].float()
 
     train_device = input_device
@@ -358,8 +512,16 @@ def main() -> None:
 
     train_history_df = pd.DataFrame(train_history_rows)
 
-    train_examples_df = pd.DataFrame(train_cache["example_rows"]).drop_duplicates(subset=["example_id"]).reset_index(drop=True)
-    train_clean_final_df = pd.DataFrame(train_cache["final_output_rows"])
+    del train_cache
+    del teacher_choice_probs_train
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    eval_cache = extract_split_cache(eval_rows, capture_final_outputs=True)
+    examples_df = pd.DataFrame(eval_cache["example_rows"]).drop_duplicates(subset=["example_id"]).reset_index(drop=True)
+    clean_final_df = pd.DataFrame(eval_cache["final_output_rows"])
+    clean_final_topk_df = pd.DataFrame(eval_cache["final_topk_rows"])
 
     choice_span_map = {
         row["example_id"]: build_choice_token_spans(
@@ -367,12 +529,12 @@ def main() -> None:
             tok=tok,
             max_seq_len=args.max_seq_len,
         )
-        for _, row in train_rows[["example_id", "text"]].iterrows()
+        for _, row in eval_rows[["example_id", "text"]].iterrows()
     }
 
     attention_rows: list[dict[str, object]] = []
-    for start in range(0, len(train_rows), ATTENTION_BATCH_SIZE):
-        batch_df = train_rows.iloc[start:start + ATTENTION_BATCH_SIZE].reset_index(drop=True)
+    for start in range(0, len(eval_rows), ATTENTION_BATCH_SIZE):
+        batch_df = eval_rows.iloc[start:start + ATTENTION_BATCH_SIZE].reset_index(drop=True)
         batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, args.max_seq_len)
         decision_pos = batch_cpu.pop("decision_pos")
         prompt_token_count = batch_cpu.pop("prompt_token_count")
@@ -421,18 +583,113 @@ def main() -> None:
                         }
                     )
 
-    train_attention_outputs_df = pd.DataFrame(attention_rows)
+    attention_outputs_df = pd.DataFrame(attention_rows)
+
+    lenses_eval = [None if lens is None else lens.to(train_device) for lens in lenses]
+    true_choice_idx_eval = eval_cache["true_choice_idx"].numpy()
+    final_choice_probs_eval = eval_cache["final_choice_probs"].numpy().astype(np.float32)
+
+    substep_rows: list[dict[str, object]] = []
+    substep_handles: list[torch.utils.hooks.RemovableHandle] = []
+    substep_cache: dict[str, dict[int, torch.Tensor]] = {
+        "pre_attn": {},
+        "post_attn": {},
+        "post_mlp": {},
+    }
+
+    def clear_substep_cache() -> None:
+        for key in substep_cache:
+            substep_cache[key].clear()
+
+    for layer_index, layer in enumerate(decoder_layers):
+        post_attn_module = get_post_attention_input_module(layer)
+
+        def make_pre_attn_hook(idx: int):
+            def hook(module, args):
+                substep_cache["pre_attn"][idx] = args[0].detach()
+            return hook
+
+        def make_post_attn_hook(idx: int):
+            def hook(module, args):
+                substep_cache["post_attn"][idx] = args[0].detach()
+            return hook
+
+        def make_post_mlp_hook(idx: int):
+            def hook(module, args, output):
+                substep_cache["post_mlp"][idx] = unpack_output_hidden(output).detach()
+            return hook
+
+        substep_handles.append(layer.register_forward_pre_hook(make_pre_attn_hook(layer_index)))
+        substep_handles.append(post_attn_module.register_forward_pre_hook(make_post_attn_hook(layer_index)))
+        substep_handles.append(layer.register_forward_hook(make_post_mlp_hook(layer_index)))
+
+    try:
+        for start in range(0, len(eval_rows), SUBSTEP_BATCH_SIZE):
+            stop = min(start + SUBSTEP_BATCH_SIZE, len(eval_rows))
+            batch_df = eval_rows.iloc[start:stop].reset_index(drop=True)
+            batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, args.max_seq_len)
+            decision_pos = batch_cpu.pop("decision_pos")
+            batch_cpu.pop("prompt_token_count")
+            batch = {k: v.to(input_device) for k, v in batch_cpu.items()}
+            decision_pos = decision_pos.to(input_device)
+            true_choice_idx_batch = torch.tensor(
+                batch_df["correct_idx"].tolist(),
+                dtype=torch.long,
+                device=train_device,
+            )
+            final_choice_prob_batch = eval_cache["final_choice_probs"][start:stop].to(train_device).float()
+
+            clear_substep_cache()
+            with torch.inference_mode():
+                _ = model(**batch, return_dict=True, use_cache=False)
+
+            for layer_index in range(num_layers):
+                layer_substeps = []
+                for substep_name in ["pre_attn", "post_attn", "post_mlp"]:
+                    hidden_full = substep_cache[substep_name][layer_index]
+                    layer_row_idx = torch.arange(len(batch_df), device=hidden_full.device)
+                    layer_decision_pos = decision_pos.to(hidden_full.device)
+                    layer_substeps.append(
+                        (substep_name, hidden_full[layer_row_idx, layer_decision_pos])
+                    )
+
+                for substep_name, hidden_batch in layer_substeps:
+                    metrics = summarize_hidden_readout(
+                        hidden_batch=hidden_batch.to(train_device),
+                        layer_index_0based=layer_index,
+                        true_choice_idx_batch=true_choice_idx_batch,
+                        final_choice_prob_batch=final_choice_prob_batch,
+                        always_apply_final_norm_if_available=True,
+                    )
+
+                    for batch_index, row in batch_df.iterrows():
+                        substep_rows.append(
+                            {
+                                "example_id": row["example_id"],
+                                "layer_number": layer_index + 1,
+                                "substep_name": substep_name,
+                                "true_choice_idx": int(row["correct_idx"]),
+                                "best_non_choice_token_id": int(metrics["best_non_choice_token_id"][batch_index].item()),
+                                "best_non_choice_logit": float(metrics["best_non_choice_logit"][batch_index].item()),
+                                "logit_A": float(metrics["logit_A"][batch_index].item()),
+                                "logit_B": float(metrics["logit_B"][batch_index].item()),
+                                "logit_C": float(metrics["logit_C"][batch_index].item()),
+                                "logit_D": float(metrics["logit_D"][batch_index].item()),
+                                "logit_E": float(metrics["logit_E"][batch_index].item()),
+                            }
+                        )
+    finally:
+        for handle in substep_handles:
+            handle.remove()
+
+    substep_outputs_df = pd.DataFrame(substep_rows)
 
     layerwise_rows: list[dict[str, object]] = []
-    true_choice_idx_train = train_cache["true_choice_idx"].numpy().astype(np.int64)
-    final_choice_probs_train = train_cache["final_choice_probs"].numpy().astype(np.float32)
-    lenses_eval = [lens.to(train_device) if lens is not None else None for lens in lenses]
-
     for method_name in ["direct_readout", "tuned_lens"]:
         for layer_index in range(num_layers):
-            for start in range(0, len(train_rows), READOUT_BATCH_SIZE):
-                stop = min(start + READOUT_BATCH_SIZE, len(train_rows))
-                hidden_batch = train_cache["hidden"][start:stop, layer_index, :].to(train_device).float()
+            for start in range(0, len(eval_rows), READOUT_BATCH_SIZE):
+                stop = min(start + READOUT_BATCH_SIZE, len(eval_rows))
+                hidden_batch = eval_cache["hidden"][start:stop, layer_index, :].to(train_device).float()
 
                 if method_name == "direct_readout":
                     readout = maybe_apply_final_norm(hidden_batch, layer_index)
@@ -442,35 +699,38 @@ def main() -> None:
                     else:
                         readout = lenses_eval[layer_index](hidden_batch)
 
-                metrics = summarize_hidden_readout(
-                    readout,
-                    layer_index,
-                    torch.tensor(true_choice_idx_train[start:stop], dtype=torch.long, device=train_device),
-                    torch.as_tensor(final_choice_probs_train[start:stop], device=train_device),
-                    always_apply_final_norm_if_available=False,
-                )
+                full_logits = torch.matmul(
+                    readout.to(lm_head_weight.dtype),
+                    lm_head_weight.T,
+                ).float()
+                masked_logits = full_logits.clone()
+                masked_logits[:, answer_id_tensor_lm_head] = -torch.inf
+                best_non_choice_logit, best_non_choice_token_id = torch.max(masked_logits, dim=-1)
 
-                metrics_cpu = {k: v.detach().cpu() for k, v in metrics.items()}
-                for batch_index in range(stop - start):
-                    global_index = start + batch_index
-                    true_idx = int(true_choice_idx_train[global_index])
+                choice_logits = full_logits.index_select(1, answer_id_tensor_lm_head)
+
+                choice_logits_cpu = choice_logits.detach().cpu().numpy().astype(np.float32)
+                best_non_choice_id_cpu = best_non_choice_token_id.detach().cpu().numpy().astype(np.int64)
+                best_non_choice_logit_cpu = best_non_choice_logit.detach().cpu().numpy().astype(np.float32)
+
+                for batch_index, example_index in enumerate(range(start, stop)):
                     layerwise_rows.append(
                         {
-                            "example_id": train_cache["example_id"][global_index],
+                            "example_id": eval_cache["example_id"][example_index],
                             "layer_number": layer_index + 1,
                             "readout_method": method_name,
-                            "true_choice_idx": true_idx,
-                            "best_non_choice_token_id": int(metrics_cpu["best_non_choice_token_id"][batch_index].item()),
-                            "best_non_choice_logit": float(metrics_cpu["best_non_choice_logit"][batch_index].item()),
-                            "logit_A": float(metrics_cpu["logit_A"][batch_index].item()),
-                            "logit_B": float(metrics_cpu["logit_B"][batch_index].item()),
-                            "logit_C": float(metrics_cpu["logit_C"][batch_index].item()),
-                            "logit_D": float(metrics_cpu["logit_D"][batch_index].item()),
-                            "logit_E": float(metrics_cpu["logit_E"][batch_index].item()),
+                            "true_choice_idx": int(true_choice_idx_eval[example_index]),
+                            "best_non_choice_token_id": int(best_non_choice_id_cpu[batch_index]),
+                            "best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
+                            "logit_A": float(choice_logits_cpu[batch_index, 0]),
+                            "logit_B": float(choice_logits_cpu[batch_index, 1]),
+                            "logit_C": float(choice_logits_cpu[batch_index, 2]),
+                            "logit_D": float(choice_logits_cpu[batch_index, 3]),
+                            "logit_E": float(choice_logits_cpu[batch_index, 4]),
                         }
                     )
 
-    train_layerwise_outputs_df = pd.DataFrame(layerwise_rows)
+    layerwise_outputs_df = pd.DataFrame(layerwise_rows)
 
     for lens in lenses_eval:
         if lens is not None:
@@ -482,11 +742,13 @@ def main() -> None:
         shutil.rmtree(tmp_dir)
     tmp_dir.mkdir(parents=True, exist_ok=False)
 
-    train_examples_df.to_parquet(tmp_dir / "train_examples.parquet", index=False)
-    train_clean_final_df.to_parquet(tmp_dir / "train_clean_final_outputs.parquet", index=False)
-    train_layerwise_outputs_df.to_parquet(tmp_dir / "train_layerwise_outputs.parquet", index=False)
-    train_attention_outputs_df.to_parquet(tmp_dir / "train_attention_outputs.parquet", index=False)
-    train_history_df.to_parquet(tmp_dir / "train_tuned_lens_training_history.parquet", index=False)
+    examples_df.to_parquet(tmp_dir / "examples.parquet", index=False)
+    clean_final_df.to_parquet(tmp_dir / "clean_final_outputs.parquet", index=False)
+    clean_final_topk_df.to_parquet(tmp_dir / "clean_final_topk.parquet", index=False)
+    layerwise_outputs_df.to_parquet(tmp_dir / "layerwise_outputs.parquet", index=False)
+    attention_outputs_df.to_parquet(tmp_dir / "attention_outputs.parquet", index=False)
+    substep_outputs_df.to_parquet(tmp_dir / "substep_outputs.parquet", index=False)
+    train_history_df.to_parquet(tmp_dir / "tuned_lens_training_history.parquet", index=False)
     torch.save(
         {
             "model_id": args.model_id,
@@ -494,29 +756,34 @@ def main() -> None:
             "hidden_size": hidden_size,
             "state_dict_by_layer_number": lens_state_dicts,
         },
-        tmp_dir / "train_tuned_lens_state.pt",
+        tmp_dir / "tuned_lens_state.pt",
     )
 
     run_config = {
         "model_id": args.model_id,
         "train_split": "train",
+        "eval_split": "validation",
         "max_seq_len": int(args.max_seq_len),
+        "top_k_final": int(args.top_k_final),
         "seed": int(args.seed),
         "extract_batch_size": EXTRACT_BATCH_SIZE,
         "readout_batch_size": READOUT_BATCH_SIZE,
         "attention_batch_size": ATTENTION_BATCH_SIZE,
+        "substep_batch_size": SUBSTEP_BATCH_SIZE,
         "tuned_lens_batch_size": TUNED_LENS_BATCH_SIZE,
         "tuned_lens_epochs": TUNED_LENS_EPOCHS,
         "tuned_lens_lr": TUNED_LENS_LR,
         "tuned_lens_weight_decay": TUNED_LENS_WEIGHT_DECAY,
         "answer_token_ids": answer_token_ids,
         "num_train_examples": int(len(train_rows)),
+        "num_eval_examples": int(len(eval_rows)),
         "num_layers": int(num_layers),
         "hidden_size": int(hidden_size),
         "model_dtype": str(model_dtype),
         "last_layer_needs_final_norm": bool(last_layer_needs_final_norm),
         "tuned_lens_target": "final_answer_choice_distribution",
         "attention_target": "decision_position_per_head_choice_attention_masses_plus_head_entropy",
+        "substep_target": "decision_position_raw_substep_choice_readouts",
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     with (tmp_dir / "run_config.json").open("w", encoding="utf-8") as f:

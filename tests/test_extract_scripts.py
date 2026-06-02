@@ -6,11 +6,11 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from src.cli import extract_trace_csqa_enc as enc_cli
-from src.cli import extract_trace_csqa_gpt as gpt_cli
-from src.cli import extract_trace_nexttok_dec as nexttok_cli
-from src.cli import extract_traces as generic_cli
-from src.cli import index_traces
+from src.legacy.cli import extract_trace_csqa_enc as enc_cli
+from src.legacy.cli import extract_trace_csqa_gpt as gpt_cli
+from src.legacy.cli import extract_trace_nexttok_dec as nexttok_cli
+from src.legacy.cli import extract_traces as generic_cli
+from src.legacy.cli import index_traces
 
 
 class TestExtractScriptsHelpers(unittest.TestCase):
@@ -87,7 +87,7 @@ class TestExtractScriptsHelpers(unittest.TestCase):
                 "text": ["t1", "t2"],
             }
         )
-        with patch("src.cli.extract_traces.load_ud_ewt", return_value=ud):
+        with patch("src.legacy.cli.extract_traces.load_ud_ewt", return_value=ud):
             out = generic_cli.get_texts("ud_ewt", "validation", 10)
             self.assertEqual(list(out.columns), ["example_id", "text"])
             self.assertEqual(len(out), 1)
@@ -99,7 +99,7 @@ class TestExtractScriptsHelpers(unittest.TestCase):
                 "text": ["happy"],
             }
         )
-        with patch("src.cli.extract_traces.load_go_emotions", return_value=(go, ["joy"])):
+        with patch("src.legacy.cli.extract_traces.load_go_emotions", return_value=(go, ["joy"])):
             out = generic_cli.get_texts("go_emotions", "validation", 10)
             self.assertEqual(list(out.columns), ["example_id", "text"])
             self.assertEqual(len(out), 1)
@@ -113,7 +113,7 @@ class TestExtractScriptsHelpers(unittest.TestCase):
                 "csqa_choices": [[{"label": "A", "text": "x"}] * 5],
             }
         )
-        with patch("src.cli.extract_traces.load_csqa", return_value=csqa):
+        with patch("src.legacy.cli.extract_traces.load_csqa", return_value=csqa):
             out = generic_cli.get_texts("csqa", "validation", 10)
             self.assertEqual(
                 list(out.columns),

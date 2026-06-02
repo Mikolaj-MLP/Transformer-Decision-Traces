@@ -21,7 +21,7 @@ def now_id() -> str:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def _resolve_out_dir(out_dir: str | None, run_id: str) -> Path:

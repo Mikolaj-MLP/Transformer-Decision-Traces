@@ -45,6 +45,7 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 LETTERS = ["A", "B", "C", "D", "E"]
 EXTRACT_BATCH_SIZE = 4
 ATTENTION_BATCH_SIZE = 1
+READOUT_BATCH_SIZE = 64
 TUNED_LENS_BATCH_SIZE = 64
 TUNED_LENS_MAX_EPOCHS = 10
 TUNED_LENS_PATIENCE = 2
@@ -539,40 +540,65 @@ def build_detector_feature_table(
 
     for layer_index in tqdm(range(hidden.shape[1]), desc=f"{split_name} detector features"):
         layer_hidden = hidden[:, layer_index, :]
-        true_choice_idx_layer = true_choice_idx.clone()
+        true_choice_idx_layer = true_choice_idx.clone().to(input_device)
 
-        direct_metrics = summarize_hidden_readout(
-            layer_hidden.to(input_device),
-            layer_index_0based=layer_index,
-            true_choice_idx_batch=true_choice_idx_layer.to(input_device),
-            maybe_apply_final_norm=maybe_apply_final_norm,
-            final_norm=final_norm,
-            lm_head_weight=lm_head_weight,
-            answer_id_tensor_lm_head=answer_id_tensor_lm_head,
-            vocab_size=vocab_size,
-            always_apply_final_norm_if_available=False,
-        )
+        direct_metrics_blocks: dict[str, list[np.ndarray]] = {}
+        tuned_metrics_blocks: dict[str, list[np.ndarray]] = {}
 
         lens = lenses[layer_index]
-        if lens is None:
-            tuned_hidden = layer_hidden.to(input_device).float()
-        else:
+        if lens is not None:
             lens = lens.to(input_device)
-            with torch.inference_mode():
-                tuned_hidden = lens(layer_hidden.to(input_device).float())
+
+        for start in range(0, layer_hidden.shape[0], READOUT_BATCH_SIZE):
+            end = start + READOUT_BATCH_SIZE
+            hidden_batch = layer_hidden[start:end].to(input_device)
+            true_choice_idx_batch = true_choice_idx_layer[start:end]
+
+            direct_metrics_batch = summarize_hidden_readout(
+                hidden_batch,
+                layer_index_0based=layer_index,
+                true_choice_idx_batch=true_choice_idx_batch,
+                maybe_apply_final_norm=maybe_apply_final_norm,
+                final_norm=final_norm,
+                lm_head_weight=lm_head_weight,
+                answer_id_tensor_lm_head=answer_id_tensor_lm_head,
+                vocab_size=vocab_size,
+                always_apply_final_norm_if_available=False,
+            )
+            for key, value in direct_metrics_batch.items():
+                direct_metrics_blocks.setdefault(key, []).append(value)
+
+            if lens is None:
+                tuned_hidden = hidden_batch.float()
+            else:
+                with torch.inference_mode():
+                    tuned_hidden = lens(hidden_batch.float())
+
+            tuned_metrics_batch = summarize_hidden_readout(
+                tuned_hidden,
+                layer_index_0based=layer_index,
+                true_choice_idx_batch=true_choice_idx_batch,
+                maybe_apply_final_norm=maybe_apply_final_norm,
+                final_norm=final_norm,
+                lm_head_weight=lm_head_weight,
+                answer_id_tensor_lm_head=answer_id_tensor_lm_head,
+                vocab_size=vocab_size,
+                always_apply_final_norm_if_available=True,
+            )
+            for key, value in tuned_metrics_batch.items():
+                tuned_metrics_blocks.setdefault(key, []).append(value)
+
+            del hidden_batch
+            del tuned_hidden
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if lens is not None:
             lens = lens.cpu()
 
-        tuned_metrics = summarize_hidden_readout(
-            tuned_hidden,
-            layer_index_0based=layer_index,
-            true_choice_idx_batch=true_choice_idx_layer.to(input_device),
-            maybe_apply_final_norm=maybe_apply_final_norm,
-            final_norm=final_norm,
-            lm_head_weight=lm_head_weight,
-            answer_id_tensor_lm_head=answer_id_tensor_lm_head,
-            vocab_size=vocab_size,
-            always_apply_final_norm_if_available=True,
-        )
+        direct_metrics = {key: np.concatenate(value, axis=0) for key, value in direct_metrics_blocks.items()}
+        tuned_metrics = {key: np.concatenate(value, axis=0) for key, value in tuned_metrics_blocks.items()}
 
         for example_index, example_id in enumerate(example_rows["example_id"].tolist()):
             attn = attention_lookup.loc[(example_id, layer_index + 1)]
@@ -1431,6 +1457,7 @@ def main() -> None:
         "target_rules": TARGET_RULES,
         "extract_batch_size": EXTRACT_BATCH_SIZE,
         "attention_batch_size": ATTENTION_BATCH_SIZE,
+        "readout_batch_size": READOUT_BATCH_SIZE,
         "steering_batch_size": STEERING_BATCH_SIZE,
         "tuned_lens_batch_size": TUNED_LENS_BATCH_SIZE,
         "tuned_lens_max_epochs": TUNED_LENS_MAX_EPOCHS,

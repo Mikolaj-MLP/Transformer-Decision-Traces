@@ -643,8 +643,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fit-split", type=str, default="train")
-    parser.add_argument("--eval-split", type=str, default="validation")
+    parser.add_argument("--fit-split", type=str, default="validation")
+    parser.add_argument("--eval-split", type=str, default="train")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
@@ -658,6 +658,22 @@ def main(argv: list[str] | None = None) -> None:
     eval_limit = args.eval_limit if args.eval_limit is not None else args.validation_limit
     if args.fit_split == args.eval_split:
         raise ValueError("--fit-split and --eval-split must be different")
+
+    print(
+        "[config]",
+        json.dumps(
+            {
+                "model_id": args.model_id,
+                "fit_split": args.fit_split,
+                "eval_split": args.eval_split,
+                "fit_limit": fit_limit,
+                "eval_limit": eval_limit,
+                "max_seq_len": args.max_seq_len,
+                "seed": args.seed,
+            },
+            indent=2,
+        ),
+    )
 
     fit_rows = load_csqa(split=args.fit_split, limit=fit_limit).copy()
     eval_rows = load_csqa(split=args.eval_split, limit=eval_limit).copy()

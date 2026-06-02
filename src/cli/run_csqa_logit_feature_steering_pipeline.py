@@ -253,30 +253,32 @@ def build_feature_table(
 
 def fit_univariate_detectors(
     *,
-    train_feature_df: pd.DataFrame,
-    validation_feature_df: pd.DataFrame,
+    fit_feature_df: pd.DataFrame,
+    eval_feature_df: pd.DataFrame,
+    fit_split_name: str,
+    eval_split_name: str,
 ) -> tuple[dict[tuple[str, int], object], pd.DataFrame, pd.DataFrame]:
     detector_models: dict[tuple[str, int], object] = {}
     coefficient_rows: list[dict[str, object]] = []
     output_rows: list[dict[str, object]] = []
 
     grouped_keys = sorted(
-        train_feature_df[["feature_name", "layer_number"]].drop_duplicates().itertuples(index=False, name=None)
+        fit_feature_df[["feature_name", "layer_number"]].drop_duplicates().itertuples(index=False, name=None)
     )
     for feature_name, layer_number in tqdm(grouped_keys, desc="detector training"):
-        train_part = train_feature_df.loc[
-            train_feature_df["feature_name"].eq(feature_name)
-            & train_feature_df["layer_number"].eq(layer_number)
+        fit_part = fit_feature_df.loc[
+            fit_feature_df["feature_name"].eq(feature_name)
+            & fit_feature_df["layer_number"].eq(layer_number)
         ].copy()
-        validation_part = validation_feature_df.loc[
-            validation_feature_df["feature_name"].eq(feature_name)
-            & validation_feature_df["layer_number"].eq(layer_number)
+        eval_part = eval_feature_df.loc[
+            eval_feature_df["feature_name"].eq(feature_name)
+            & eval_feature_df["layer_number"].eq(layer_number)
         ].copy()
 
-        X_train = train_part[["feature_value"]].to_numpy(dtype=float)
-        y_train = train_part["final_error"].to_numpy(dtype=int)
-        X_validation = validation_part[["feature_value"]].to_numpy(dtype=float)
-        y_validation = validation_part["final_error"].to_numpy(dtype=int)
+        X_fit = fit_part[["feature_value"]].to_numpy(dtype=float)
+        y_fit = fit_part["final_error"].to_numpy(dtype=int)
+        X_eval = eval_part[["feature_value"]].to_numpy(dtype=float)
+        y_eval = eval_part["final_error"].to_numpy(dtype=int)
 
         pipe = make_pipeline(
             StandardScaler(),
@@ -292,17 +294,17 @@ def fit_univariate_detectors(
                 refit=True,
             ),
         )
-        pipe.fit(X_train, y_train)
+        pipe.fit(X_fit, y_fit)
         detector_models[(feature_name, int(layer_number))] = pipe
 
         scaler = pipe.named_steps["standardscaler"]
         model = pipe.named_steps["logisticregressioncv"]
         selected_c = float(np.ravel(model.C_)[0])
 
-        train_prob = pipe.predict_proba(X_train)[:, 1]
-        validation_prob = pipe.predict_proba(X_validation)[:, 1]
-        train_pred = (train_prob >= 0.5).astype(int)
-        validation_pred = (validation_prob >= 0.5).astype(int)
+        fit_prob = pipe.predict_proba(X_fit)[:, 1]
+        eval_prob = pipe.predict_proba(X_eval)[:, 1]
+        fit_pred = (fit_prob >= 0.5).astype(int)
+        eval_pred = (eval_prob >= 0.5).astype(int)
 
         coefficient_rows.append(
             {
@@ -319,8 +321,8 @@ def fit_univariate_detectors(
         )
 
         for part_name, part, prob, pred in [
-            ("train", train_part, train_prob, train_pred),
-            ("validation", validation_part, validation_prob, validation_pred),
+            (fit_split_name, fit_part, fit_prob, fit_pred),
+            (eval_split_name, eval_part, eval_prob, eval_pred),
         ]:
             for row_index, example_id in enumerate(part["example_id"].tolist()):
                 output_rows.append(
@@ -343,15 +345,15 @@ def fit_univariate_detectors(
     )
 
 
-def build_feature_target_stats(train_feature_df: pd.DataFrame) -> pd.DataFrame:
+def build_feature_target_stats(fit_feature_df: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     grouped_keys = sorted(
-        train_feature_df[["feature_name", "layer_number"]].drop_duplicates().itertuples(index=False, name=None)
+        fit_feature_df[["feature_name", "layer_number"]].drop_duplicates().itertuples(index=False, name=None)
     )
     for feature_name, layer_number in grouped_keys:
-        part = train_feature_df.loc[
-            train_feature_df["feature_name"].eq(feature_name)
-            & train_feature_df["layer_number"].eq(layer_number)
+        part = fit_feature_df.loc[
+            fit_feature_df["feature_name"].eq(feature_name)
+            & fit_feature_df["layer_number"].eq(layer_number)
         ].copy()
         correct_values = part.loc[part["clean_is_correct"], "feature_value"].to_numpy(dtype=float)
         incorrect_values = part.loc[~part["clean_is_correct"], "feature_value"].to_numpy(dtype=float)
@@ -478,9 +480,9 @@ def compute_feature_steering_delta(
 
 def run_validation_policy(
     *,
-    validation_rows: pd.DataFrame,
-    validation_cache: dict[str, object],
-    validation_detector_outputs_df: pd.DataFrame,
+    eval_rows: pd.DataFrame,
+    eval_cache: dict[str, object],
+    eval_detector_outputs_df: pd.DataFrame,
     target_stats_df: pd.DataFrame,
     tok: AutoTokenizer,
     model: AutoModelForCausalLM,
@@ -492,20 +494,21 @@ def run_validation_policy(
     maybe_apply_final_norm,
     vocab_size: int,
     max_seq_len: int,
+    eval_split_name: str,
 ) -> pd.DataFrame:
-    detector_lookup = validation_detector_outputs_df.set_index(["example_id", "feature_name", "layer_number"])
+    detector_lookup = eval_detector_outputs_df.set_index(["example_id", "feature_name", "layer_number"])
     target_lookup = target_stats_df.set_index(["feature_name", "layer_number"])
 
-    validation_choice_logits = validation_cache["clean_choice_logits"]
-    validation_best_non_choice_logit = validation_cache["clean_best_non_choice_logit"]
-    validation_best_non_choice_token_id = validation_cache["clean_best_non_choice_token_id"]
-    example_ids = [row["example_id"] for row in validation_cache["example_rows"]]
+    validation_choice_logits = eval_cache["clean_choice_logits"]
+    validation_best_non_choice_logit = eval_cache["clean_best_non_choice_logit"]
+    validation_best_non_choice_token_id = eval_cache["clean_best_non_choice_token_id"]
+    example_ids = [row["example_id"] for row in eval_cache["example_rows"]]
     example_id_to_index = {example_id: idx for idx, example_id in enumerate(example_ids)}
 
     rows: list[dict[str, object]] = []
     total_steps = len(decoder_layers) * len(FEATURE_NAMES)
 
-    with tqdm(total=total_steps, desc="validation policy sweep") as pbar:
+    with tqdm(total=total_steps, desc=f"{eval_split_name} policy sweep") as pbar:
         for feature_name in FEATURE_NAMES:
             for layer_number in range(1, len(decoder_layers) + 1):
                 steering_module = decoder_layers[layer_number - 1]
@@ -522,8 +525,8 @@ def run_validation_policy(
                 )
                 detector_pred_all = detector_prob_all >= 0.5
 
-                for start in range(0, len(validation_rows), INTERVENTION_BATCH_SIZE):
-                    batch_df = validation_rows.iloc[start:start + INTERVENTION_BATCH_SIZE].reset_index(drop=True)
+                for start in range(0, len(eval_rows), INTERVENTION_BATCH_SIZE):
+                    batch_df = eval_rows.iloc[start:start + INTERVENTION_BATCH_SIZE].reset_index(drop=True)
                     batch_indices = [example_id_to_index[example_id] for example_id in batch_df["example_id"].tolist()]
                     batch_detector_prob = detector_prob_all[batch_indices]
                     batch_detector_pred = detector_pred_all[batch_indices]
@@ -640,6 +643,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--fit-split", type=str, default="train")
+    parser.add_argument("--eval-split", type=str, default="validation")
+    parser.add_argument("--fit-limit", type=int, default=None)
+    parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
     args = parser.parse_args(argv)
@@ -647,9 +654,14 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    train_rows = load_csqa(split="train", limit=args.train_limit).copy()
-    validation_rows = load_csqa(split="validation", limit=args.validation_limit).copy()
-    for frame in [train_rows, validation_rows]:
+    fit_limit = args.fit_limit if args.fit_limit is not None else args.train_limit
+    eval_limit = args.eval_limit if args.eval_limit is not None else args.validation_limit
+    if args.fit_split == args.eval_split:
+        raise ValueError("--fit-split and --eval-split must be different")
+
+    fit_rows = load_csqa(split=args.fit_split, limit=fit_limit).copy()
+    eval_rows = load_csqa(split=args.eval_split, limit=eval_limit).copy()
+    for frame in [fit_rows, eval_rows]:
         frame["prompt_len_chars"] = frame["text"].str.len()
 
     model_dtype, device_map = choose_model_dtype_and_device_map()
@@ -690,9 +702,9 @@ def main(argv: list[str] | None = None) -> None:
     maybe_apply_final_norm = readout_ctx["maybe_apply_final_norm"]
     last_layer_needs_final_norm = readout_ctx["last_layer_needs_final_norm"]
 
-    train_cache = extract_split_cache(
-        train_rows,
-        split_name="train",
+    fit_cache = extract_split_cache(
+        fit_rows,
+        split_name=args.fit_split,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -705,9 +717,9 @@ def main(argv: list[str] | None = None) -> None:
         batch_size=EXTRACT_BATCH_SIZE,
         last_layer_needs_final_norm=last_layer_needs_final_norm,
     )
-    validation_cache = extract_split_cache(
-        validation_rows,
-        split_name="validation",
+    eval_cache = extract_split_cache(
+        eval_rows,
+        split_name=args.eval_split,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -721,18 +733,18 @@ def main(argv: list[str] | None = None) -> None:
         last_layer_needs_final_norm=last_layer_needs_final_norm,
     )
 
-    train_feature_df = build_feature_table(
-        split_name="train",
-        cache=train_cache,
+    fit_feature_df = build_feature_table(
+        split_name=args.fit_split,
+        cache=fit_cache,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
         input_device=input_device,
         vocab_size=vocab_size,
     )
-    validation_feature_df = build_feature_table(
-        split_name="validation",
-        cache=validation_cache,
+    eval_feature_df = build_feature_table(
+        split_name=args.eval_split,
+        cache=eval_cache,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -741,17 +753,19 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     detector_models, detector_coefficients_df, detector_outputs_df = fit_univariate_detectors(
-        train_feature_df=train_feature_df,
-        validation_feature_df=validation_feature_df,
+        fit_feature_df=fit_feature_df,
+        eval_feature_df=eval_feature_df,
+        fit_split_name=args.fit_split,
+        eval_split_name=args.eval_split,
     )
     del detector_models
 
-    target_stats_df = build_feature_target_stats(train_feature_df)
+    target_stats_df = build_feature_target_stats(fit_feature_df)
 
     validation_policy_outputs_raw_df = run_validation_policy(
-        validation_rows=validation_rows,
-        validation_cache=validation_cache,
-        validation_detector_outputs_df=detector_outputs_df.loc[detector_outputs_df["split"].eq("validation")].copy(),
+        eval_rows=eval_rows,
+        eval_cache=eval_cache,
+        eval_detector_outputs_df=detector_outputs_df.loc[detector_outputs_df["split"].eq(args.eval_split)].copy(),
         target_stats_df=target_stats_df,
         tok=tok,
         model=model,
@@ -763,28 +777,31 @@ def main(argv: list[str] | None = None) -> None:
         maybe_apply_final_norm=maybe_apply_final_norm,
         vocab_size=vocab_size,
         max_seq_len=args.max_seq_len,
+        eval_split_name=args.eval_split,
     )
 
     out_dir = resolve_out_dir(args.out_dir, args.model_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(train_cache["example_rows"]).to_parquet(out_dir / "train_examples.parquet", index=False)
-    pd.DataFrame(validation_cache["example_rows"]).to_parquet(out_dir / "validation_examples.parquet", index=False)
-    pd.DataFrame(train_cache["clean_output_rows"]).to_parquet(out_dir / "train_clean_final_outputs.parquet", index=False)
-    pd.DataFrame(validation_cache["clean_output_rows"]).to_parquet(out_dir / "validation_clean_final_outputs.parquet", index=False)
-    train_feature_df.to_parquet(out_dir / "train_univariate_feature_values.parquet", index=False)
-    validation_feature_df.to_parquet(out_dir / "validation_univariate_feature_values.parquet", index=False)
+    pd.DataFrame(fit_cache["example_rows"]).to_parquet(out_dir / f"{args.fit_split}_examples.parquet", index=False)
+    pd.DataFrame(eval_cache["example_rows"]).to_parquet(out_dir / f"{args.eval_split}_examples.parquet", index=False)
+    pd.DataFrame(fit_cache["clean_output_rows"]).to_parquet(out_dir / f"{args.fit_split}_clean_final_outputs.parquet", index=False)
+    pd.DataFrame(eval_cache["clean_output_rows"]).to_parquet(out_dir / f"{args.eval_split}_clean_final_outputs.parquet", index=False)
+    fit_feature_df.to_parquet(out_dir / f"{args.fit_split}_univariate_feature_values.parquet", index=False)
+    eval_feature_df.to_parquet(out_dir / f"{args.eval_split}_univariate_feature_values.parquet", index=False)
     detector_coefficients_df.to_parquet(out_dir / "detector_coefficients.parquet", index=False)
     detector_outputs_df.to_parquet(out_dir / "detector_outputs.parquet", index=False)
     target_stats_df.to_parquet(out_dir / "feature_target_stats.parquet", index=False)
-    validation_policy_outputs_raw_df.to_parquet(out_dir / "validation_policy_outputs_raw.parquet", index=False)
+    validation_policy_outputs_raw_df.to_parquet(out_dir / f"{args.eval_split}_policy_outputs_raw.parquet", index=False)
 
     run_config = {
         "model_id": args.model_id,
         "seed": int(args.seed),
         "max_seq_len": int(args.max_seq_len),
-        "train_limit": args.train_limit,
-        "validation_limit": args.validation_limit,
+        "fit_split": args.fit_split,
+        "eval_split": args.eval_split,
+        "fit_limit": fit_limit,
+        "eval_limit": eval_limit,
         "method": "univariate_logit_feature_steering",
         "feature_names": FEATURE_NAMES,
         "target_lower_quantile": TARGET_LOWER_QUANTILE,

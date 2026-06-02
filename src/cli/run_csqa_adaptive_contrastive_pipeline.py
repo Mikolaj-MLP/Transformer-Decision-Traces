@@ -4,10 +4,12 @@ import argparse
 import gc
 import json
 import math
+import os
 import re
 import shutil
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +23,25 @@ from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"The default value for l1_ratios will change from None to \(0\.0,\) in version 1\.10\..*",
+    category=FutureWarning,
+    module=r"sklearn\.linear_model\._logistic",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"'penalty' was deprecated in version 1\.8 and will be removed in 1\.10\..*",
+    category=FutureWarning,
+    module=r"sklearn\.linear_model\._logistic",
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"The fitted attributes of LogisticRegressionCV will be simplified in scikit-learn 1\.10 to remove redundancy\..*",
+    category=FutureWarning,
+    module=r"sklearn\.linear_model\._logistic",
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -90,6 +111,14 @@ def choose_model_dtype_and_device_map() -> tuple[torch.dtype, str | None]:
             return torch.bfloat16, "auto"
         return torch.float16, "auto"
     return torch.float32, None
+
+
+def resolve_hf_token() -> str | None:
+    for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"]:
+        value = os.getenv(key)
+        if value:
+            return value
+    return None
 
 
 def maybe_clone_to_float_cpu(x: torch.Tensor) -> np.ndarray:
@@ -1242,7 +1271,7 @@ def select_best_policy(policy_summary_df: pd.DataFrame) -> dict[str, object]:
     }
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--out-dir", type=str, default=None)
@@ -1251,7 +1280,7 @@ def main() -> None:
     parser.add_argument("--scale-cap-quantile", type=float, default=0.95)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1263,13 +1292,16 @@ def main() -> None:
 
     model_dtype, device_map = choose_model_dtype_and_device_map()
 
-    tok = AutoTokenizer.from_pretrained(args.model_id)
+    hf_token = resolve_hf_token()
+
+    tok = AutoTokenizer.from_pretrained(args.model_id, token=hf_token)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
+        token=hf_token,
         dtype=model_dtype,
         device_map=device_map,
         attn_implementation="eager",

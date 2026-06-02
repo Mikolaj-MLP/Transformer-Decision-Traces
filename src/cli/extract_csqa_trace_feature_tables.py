@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -78,6 +79,14 @@ def choose_model_dtype_and_device_map() -> tuple[torch.dtype, str | None]:
             return torch.bfloat16, "auto"
         return torch.float16, "auto"
     return torch.float32, None
+
+
+def resolve_hf_token() -> str | None:
+    for key in ["HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN"]:
+        value = os.getenv(key)
+        if value:
+            return value
+    return None
 
 
 def prepare_readout_context(
@@ -444,7 +453,7 @@ def build_headwise_attention_entropy_table(
     return pd.DataFrame(rows)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--out-dir", type=str, default=None)
@@ -452,7 +461,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -464,13 +473,16 @@ def main() -> None:
 
     model_dtype, device_map = choose_model_dtype_and_device_map()
 
-    tok = AutoTokenizer.from_pretrained(args.model_id)
+    hf_token = resolve_hf_token()
+
+    tok = AutoTokenizer.from_pretrained(args.model_id, token=hf_token)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_id,
+        token=hf_token,
         dtype=model_dtype,
         device_map=device_map,
         attn_implementation="eager",

@@ -553,13 +553,7 @@ def run_validation_policy(
                     ],
                     dtype=np.float32,
                 )
-                detector_pred_all = np.array(
-                    [
-                        bool(detector_lookup.loc[(example_id, feature_name, layer_number), "detector_predicted_error"])
-                        for example_id in example_ids
-                    ],
-                    dtype=bool,
-                )
+                detector_pred_all = detector_prob_all >= 0.5
 
                 for start in range(0, len(validation_rows), INTERVENTION_BATCH_SIZE):
                     batch_df = validation_rows.iloc[start:start + INTERVENTION_BATCH_SIZE].reset_index(drop=True)

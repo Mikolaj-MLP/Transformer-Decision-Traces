@@ -255,10 +255,9 @@ def fit_univariate_detectors(
     *,
     train_feature_df: pd.DataFrame,
     validation_feature_df: pd.DataFrame,
-) -> tuple[dict[tuple[str, int], object], pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[dict[tuple[str, int], object], pd.DataFrame, pd.DataFrame]:
     detector_models: dict[tuple[str, int], object] = {}
     coefficient_rows: list[dict[str, object]] = []
-    summary_rows: list[dict[str, object]] = []
     output_rows: list[dict[str, object]] = []
 
     grouped_keys = sorted(
@@ -305,34 +304,6 @@ def fit_univariate_detectors(
         train_pred = (train_prob >= 0.5).astype(int)
         validation_pred = (validation_prob >= 0.5).astype(int)
 
-        validation_tp = int(np.sum((validation_pred == 1) & (y_validation == 1)))
-        validation_fp = int(np.sum((validation_pred == 1) & (y_validation == 0)))
-        validation_tn = int(np.sum((validation_pred == 0) & (y_validation == 0)))
-        validation_fn = int(np.sum((validation_pred == 0) & (y_validation == 1)))
-
-        summary_rows.append(
-            {
-                "feature_name": feature_name,
-                "layer_number": int(layer_number),
-                "selected_c": selected_c,
-                "train_error_rate": float(y_train.mean()),
-                "validation_error_rate": float(y_validation.mean()),
-                "train_roc_auc_error": float(roc_auc_score(y_train, train_prob)),
-                "train_pr_auc_error": float(average_precision_score(y_train, train_prob)),
-                "validation_roc_auc_error": float(roc_auc_score(y_validation, validation_prob)),
-                "validation_pr_auc_error": float(average_precision_score(y_validation, validation_prob)),
-                "train_flag_rate": float(train_pred.mean()),
-                "validation_flag_rate": float(validation_pred.mean()),
-                "validation_precision": float(validation_tp / max(validation_tp + validation_fp, 1)),
-                "validation_recall": float(validation_tp / max(validation_tp + validation_fn, 1)),
-                "validation_false_positive_rate": float(validation_fp / max(validation_fp + validation_tn, 1)),
-                "validation_tp": validation_tp,
-                "validation_fp": validation_fp,
-                "validation_tn": validation_tn,
-                "validation_fn": validation_fn,
-            }
-        )
-
         coefficient_rows.append(
             {
                 "feature_name": feature_name,
@@ -368,7 +339,6 @@ def fit_univariate_detectors(
     return (
         detector_models,
         pd.DataFrame(coefficient_rows),
-        pd.DataFrame(summary_rows),
         pd.DataFrame(output_rows),
     )
 
@@ -498,10 +468,7 @@ def compute_feature_steering_delta(
 
     return {
         "delta": delta.detach(),
-        "current_feature_value": current_feature.detach().cpu().numpy().astype(np.float32),
-        "target_feature_value": target_feature.detach().cpu().numpy().astype(np.float32),
         "steered_feature_value_local": steered_feature.cpu().numpy().astype(np.float32),
-        "requested_feature_delta": desired_shift.detach().cpu().numpy().astype(np.float32),
         "grad_l2_norm": np.asarray(grad_norms, dtype=np.float32),
         "delta_l2_norm": delta_l2.detach().cpu().numpy().astype(np.float32),
         "delta_over_token_hidden_l2": delta_over_hidden.detach().cpu().numpy().astype(np.float32),
@@ -667,142 +634,6 @@ def run_validation_policy(
 
     return pd.DataFrame(rows)
 
-
-def summarize_policy_results(
-    *,
-    validation_clean_outputs_df: pd.DataFrame,
-    policy_outputs_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    merged = policy_outputs_df.merge(
-        validation_clean_outputs_df.rename(
-            columns={
-                "clean_logit_A": "baseline_logit_A",
-                "clean_logit_B": "baseline_logit_B",
-                "clean_logit_C": "baseline_logit_C",
-                "clean_logit_D": "baseline_logit_D",
-                "clean_logit_E": "baseline_logit_E",
-                "best_non_choice_token_id": "baseline_best_non_choice_token_id",
-                "best_non_choice_logit": "baseline_best_non_choice_logit",
-            }
-        ),
-        on="example_id",
-        how="left",
-        validate="many_to_one",
-    )
-
-    baseline_choice_logits = merged[
-        ["baseline_logit_A", "baseline_logit_B", "baseline_logit_C", "baseline_logit_D", "baseline_logit_E"]
-    ].to_numpy(dtype=np.float32)
-    steered_choice_logits = merged[
-        ["steered_logit_A", "steered_logit_B", "steered_logit_C", "steered_logit_D", "steered_logit_E"]
-    ].to_numpy(dtype=np.float32)
-    true_choice_idx = merged["true_choice_idx"].to_numpy(dtype=np.int64)
-
-    clean_pred_idx = choice_logits_to_pred_idx(baseline_choice_logits)
-    steered_pred_idx = choice_logits_to_pred_idx(steered_choice_logits)
-    clean_is_correct = clean_pred_idx == true_choice_idx
-    steered_is_correct = steered_pred_idx == true_choice_idx
-    detector_predicted_error = merged["detector_probability_error"].to_numpy(dtype=float) >= 0.5
-
-    merged["clean_predicted_choice_idx"] = clean_pred_idx
-    merged["steered_predicted_choice_idx"] = steered_pred_idx
-    merged["clean_is_correct"] = clean_is_correct
-    merged["steered_is_correct"] = steered_is_correct
-    merged["detector_predicted_error"] = detector_predicted_error
-    merged["prediction_changed"] = clean_pred_idx != steered_pred_idx
-    merged["rescued_error"] = (~clean_is_correct) & steered_is_correct
-    merged["harmed_correct"] = clean_is_correct & (~steered_is_correct)
-    merged["clean_answer_choice_entropy"] = choice_logits_to_entropy(baseline_choice_logits)
-    merged["steered_answer_choice_entropy"] = choice_logits_to_entropy(steered_choice_logits)
-    merged["clean_answer_choice_top1_top2_logit_gap"] = choice_logits_to_gap(baseline_choice_logits)
-    merged["steered_answer_choice_top1_top2_logit_gap"] = choice_logits_to_gap(steered_choice_logits)
-    merged["clean_answer_choice_top1_probability"] = choice_logits_to_top1_prob(baseline_choice_logits)
-    merged["steered_answer_choice_top1_probability"] = choice_logits_to_top1_prob(steered_choice_logits)
-    merged["clean_answer_choice_varentropy"] = choice_logits_to_varentropy(baseline_choice_logits)
-    merged["steered_answer_choice_varentropy"] = choice_logits_to_varentropy(steered_choice_logits)
-    merged["delta_answer_choice_entropy"] = merged["steered_answer_choice_entropy"] - merged["clean_answer_choice_entropy"]
-    merged["delta_answer_choice_top1_top2_logit_gap"] = (
-        merged["steered_answer_choice_top1_top2_logit_gap"] - merged["clean_answer_choice_top1_top2_logit_gap"]
-    )
-    merged["delta_answer_choice_top1_probability"] = (
-        merged["steered_answer_choice_top1_probability"] - merged["clean_answer_choice_top1_probability"]
-    )
-    merged["delta_answer_choice_varentropy"] = (
-        merged["steered_answer_choice_varentropy"] - merged["clean_answer_choice_varentropy"]
-    )
-
-    validation_choice_logits = validation_clean_outputs_df[
-        ["clean_logit_A", "clean_logit_B", "clean_logit_C", "clean_logit_D", "clean_logit_E"]
-    ].to_numpy(dtype=np.float32)
-    validation_true = validation_clean_outputs_df["true_choice_idx"].to_numpy(dtype=np.int64)
-    validation_clean_correct = choice_logits_to_pred_idx(validation_choice_logits) == validation_true
-    clean_accuracy = float(validation_clean_correct.mean())
-    n_total = int(len(validation_clean_outputs_df))
-    n_clean_correct = int(validation_clean_correct.sum())
-    n_clean_incorrect = int(n_total - n_clean_correct)
-
-    summary_rows: list[dict[str, object]] = []
-    for (feature_name, layer_number), part in merged.groupby(["feature_name", "layer_number"], sort=True):
-        steered_correct = part["steered_is_correct"].to_numpy(dtype=bool)
-        rescued = part["rescued_error"].to_numpy(dtype=bool)
-        harmed = part["harmed_correct"].to_numpy(dtype=bool)
-        flagged = part["detector_predicted_error"].to_numpy(dtype=bool)
-        steered_accuracy = float(steered_correct.mean())
-        rescued_count = int(rescued.sum())
-        harmed_count = int(harmed.sum())
-        summary_rows.append(
-            {
-                "feature_name": feature_name,
-                "layer_number": int(layer_number),
-                "n_total": n_total,
-                "n_clean_correct": n_clean_correct,
-                "n_clean_incorrect": n_clean_incorrect,
-                "clean_accuracy": clean_accuracy,
-                "steered_accuracy": steered_accuracy,
-                "accuracy_delta": steered_accuracy - clean_accuracy,
-                "flagged_count": int(flagged.sum()),
-                "flag_rate": float(flagged.mean()),
-                "rescued_count": rescued_count,
-                "harmed_count": harmed_count,
-                "net_gain_count": int(rescued_count - harmed_count),
-                "rescued_rate_among_incorrect": float(rescued_count / max(n_clean_incorrect, 1)),
-                "harmed_rate_among_correct": float(harmed_count / max(n_clean_correct, 1)),
-                "prediction_changed_count": int(part["prediction_changed"].sum()),
-                "mean_requested_feature_delta": float(part["requested_feature_delta"].mean()),
-                "mean_abs_requested_feature_delta": float(part["requested_feature_delta"].abs().mean()),
-                "mean_grad_l2_norm": float(part["grad_l2_norm"].mean()),
-                "mean_delta_l2_norm": float(part["delta_l2_norm"].mean()),
-                "mean_delta_over_token_hidden_l2": float(part["delta_over_token_hidden_l2"].mean()),
-                "mean_detector_probability_error": float(part["detector_probability_error"].mean()),
-                "flagged_precision": float(
-                    part.loc[part["detector_predicted_error"], "clean_is_correct"].rsub(1).mean()
-                    if int(flagged.sum()) > 0
-                    else np.nan
-                ),
-            }
-        )
-
-    summary_df = pd.DataFrame(summary_rows).sort_values(
-        ["net_gain_count", "accuracy_delta", "rescued_count", "harmed_count", "mean_delta_l2_norm"],
-        ascending=[False, False, False, True, True],
-    ).reset_index(drop=True)
-    return merged, summary_df
-
-
-def select_best_policy(policy_summary_df: pd.DataFrame) -> dict[str, object]:
-    best_row = policy_summary_df.iloc[0]
-    return {
-        "feature_name": str(best_row["feature_name"]),
-        "layer_number": int(best_row["layer_number"]),
-        "net_gain_count": int(best_row["net_gain_count"]),
-        "accuracy_delta": float(best_row["accuracy_delta"]),
-        "rescued_count": int(best_row["rescued_count"]),
-        "harmed_count": int(best_row["harmed_count"]),
-        "flagged_count": int(best_row["flagged_count"]),
-        "mean_delta_l2_norm": float(best_row["mean_delta_l2_norm"]),
-    }
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
@@ -909,7 +740,7 @@ def main(argv: list[str] | None = None) -> None:
         vocab_size=vocab_size,
     )
 
-    detector_models, detector_coefficients_df, detector_summary_df, detector_outputs_df = fit_univariate_detectors(
+    detector_models, detector_coefficients_df, detector_outputs_df = fit_univariate_detectors(
         train_feature_df=train_feature_df,
         validation_feature_df=validation_feature_df,
     )
@@ -934,29 +765,19 @@ def main(argv: list[str] | None = None) -> None:
         max_seq_len=args.max_seq_len,
     )
 
-    validation_clean_outputs_df = pd.DataFrame(validation_cache["clean_output_rows"])
-    validation_policy_outputs_derived_df, validation_policy_summary_df = summarize_policy_results(
-        validation_clean_outputs_df=validation_clean_outputs_df,
-        policy_outputs_df=validation_policy_outputs_raw_df,
-    )
-    best_policy = select_best_policy(validation_policy_summary_df)
-
-    detector_outputs_raw_df = detector_outputs_df.copy()
-    policy_outputs_raw_df = validation_policy_outputs_raw_df.copy()
-
     out_dir = resolve_out_dir(args.out_dir, args.model_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pd.DataFrame(train_cache["example_rows"]).to_parquet(out_dir / "train_examples.parquet", index=False)
     pd.DataFrame(validation_cache["example_rows"]).to_parquet(out_dir / "validation_examples.parquet", index=False)
     pd.DataFrame(train_cache["clean_output_rows"]).to_parquet(out_dir / "train_clean_final_outputs.parquet", index=False)
-    validation_clean_outputs_df.to_parquet(out_dir / "validation_clean_final_outputs.parquet", index=False)
+    pd.DataFrame(validation_cache["clean_output_rows"]).to_parquet(out_dir / "validation_clean_final_outputs.parquet", index=False)
     train_feature_df.to_parquet(out_dir / "train_univariate_feature_values.parquet", index=False)
     validation_feature_df.to_parquet(out_dir / "validation_univariate_feature_values.parquet", index=False)
     detector_coefficients_df.to_parquet(out_dir / "detector_coefficients.parquet", index=False)
-    detector_outputs_raw_df.to_parquet(out_dir / "detector_outputs.parquet", index=False)
+    detector_outputs_df.to_parquet(out_dir / "detector_outputs.parquet", index=False)
     target_stats_df.to_parquet(out_dir / "feature_target_stats.parquet", index=False)
-    policy_outputs_raw_df.to_parquet(out_dir / "validation_policy_outputs_raw.parquet", index=False)
+    validation_policy_outputs_raw_df.to_parquet(out_dir / "validation_policy_outputs_raw.parquet", index=False)
 
     run_config = {
         "model_id": args.model_id,
@@ -972,7 +793,6 @@ def main(argv: list[str] | None = None) -> None:
         "readout_batch_size": READOUT_BATCH_SIZE,
         "intervention_batch_size": INTERVENTION_BATCH_SIZE,
         "last_layer_needs_final_norm": bool(last_layer_needs_final_norm),
-        "best_policy": best_policy,
     }
     with open(out_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)

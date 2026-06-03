@@ -444,6 +444,7 @@ def prepare_readout_context(
     input_device: torch.device,
     num_layers: int,
     max_seq_len: int,
+    probe_rows: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     final_norm = get_final_norm_module(model)
     lm_head_weight = model.lm_head.weight.detach()
@@ -454,7 +455,10 @@ def prepare_readout_context(
     answer_id_tensor_lm_head = answer_id_tensor_cpu.to(lm_head_device)
     answer_choice_weight = lm_head_weight.index_select(0, answer_id_tensor_lm_head)
 
-    probe_rows = load_csqa(split="validation", limit=1).copy()
+    if probe_rows is None:
+        probe_rows = load_csqa(split="validation", limit=1).copy()
+    else:
+        probe_rows = probe_rows.iloc[:1].copy()
     probe_cpu = encode_prompts(probe_rows["text"].tolist(), tok, max_seq_len)
     probe_pos = int(probe_cpu["decision_pos"][0].item())
     probe_batch = {

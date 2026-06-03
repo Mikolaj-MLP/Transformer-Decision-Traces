@@ -63,7 +63,7 @@ from src.csqa.common import (  # noqa: E402
     summarize_decision_logits,
     unpack_output_hidden,
 )
-from src.data.load_csqa import load_csqa  # noqa: E402
+from src.data.load_mcqa import SUPPORTED_DATASETS, load_mcqa  # noqa: E402
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
@@ -95,11 +95,11 @@ def slugify_model_id(model_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", model_id).strip("-")
 
 
-def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
+def resolve_out_dir(out_dir: str | None, model_id: str, dataset_name: str) -> Path:
     root = repo_root()
     if out_dir is None:
-        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_logit_feature_steering_pipeline"
-        return root / "data" / "generated" / "csqa_logit_feature_steering_pipeline" / run_name
+        run_name = f"{now_id()}_{slugify_model_id(model_id)}_{dataset_name}_logit_feature_steering_pipeline"
+        return root / "data" / "generated" / "logit_feature_steering_pipeline" / run_name
     path = Path(out_dir)
     return path if path.is_absolute() else (root / path)
 
@@ -639,6 +639,7 @@ def run_validation_policy(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="csqa", choices=SUPPORTED_DATASETS)
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
@@ -649,6 +650,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
+    parser.add_argument("--aqua-train-size", type=int, default=10_000)
+    parser.add_argument("--aqua-validation-size", type=int, default=5_000)
+    parser.add_argument("--aqua-test-size", type=int, default=5_000)
+    parser.add_argument("--aqua-split-seed", type=int, default=42)
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
@@ -663,6 +668,7 @@ def main(argv: list[str] | None = None) -> None:
         "[config]",
         json.dumps(
             {
+                "dataset": args.dataset,
                 "model_id": args.model_id,
                 "fit_split": args.fit_split,
                 "eval_split": args.eval_split,
@@ -670,13 +676,33 @@ def main(argv: list[str] | None = None) -> None:
                 "eval_limit": eval_limit,
                 "max_seq_len": args.max_seq_len,
                 "seed": args.seed,
+                "aqua_train_size": args.aqua_train_size,
+                "aqua_validation_size": args.aqua_validation_size,
+                "aqua_test_size": args.aqua_test_size,
+                "aqua_split_seed": args.aqua_split_seed,
             },
             indent=2,
         ),
     )
 
-    fit_rows = load_csqa(split=args.fit_split, limit=fit_limit).copy()
-    eval_rows = load_csqa(split=args.eval_split, limit=eval_limit).copy()
+    fit_rows = load_mcqa(
+        args.dataset,
+        split=args.fit_split,
+        limit=fit_limit,
+        aqua_train_size=args.aqua_train_size,
+        aqua_validation_size=args.aqua_validation_size,
+        aqua_test_size=args.aqua_test_size,
+        aqua_split_seed=args.aqua_split_seed,
+    ).copy()
+    eval_rows = load_mcqa(
+        args.dataset,
+        split=args.eval_split,
+        limit=eval_limit,
+        aqua_train_size=args.aqua_train_size,
+        aqua_validation_size=args.aqua_validation_size,
+        aqua_test_size=args.aqua_test_size,
+        aqua_split_seed=args.aqua_split_seed,
+    ).copy()
     for frame in [fit_rows, eval_rows]:
         frame["prompt_len_chars"] = frame["text"].str.len()
 
@@ -709,6 +735,7 @@ def main(argv: list[str] | None = None) -> None:
         input_device=input_device,
         num_layers=num_layers,
         max_seq_len=args.max_seq_len,
+        probe_rows=eval_rows,
     )
     final_norm = readout_ctx["final_norm"]
     answer_id_tensor_cpu = readout_ctx["answer_id_tensor_cpu"]
@@ -796,7 +823,7 @@ def main(argv: list[str] | None = None) -> None:
         eval_split_name=args.eval_split,
     )
 
-    out_dir = resolve_out_dir(args.out_dir, args.model_id)
+    out_dir = resolve_out_dir(args.out_dir, args.model_id, args.dataset)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     pd.DataFrame(fit_cache["example_rows"]).to_parquet(out_dir / f"{args.fit_split}_examples.parquet", index=False)
@@ -811,6 +838,7 @@ def main(argv: list[str] | None = None) -> None:
     validation_policy_outputs_raw_df.to_parquet(out_dir / f"{args.eval_split}_policy_outputs_raw.parquet", index=False)
 
     run_config = {
+        "dataset": args.dataset,
         "model_id": args.model_id,
         "seed": int(args.seed),
         "max_seq_len": int(args.max_seq_len),
@@ -818,6 +846,10 @@ def main(argv: list[str] | None = None) -> None:
         "eval_split": args.eval_split,
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
+        "aqua_train_size": int(args.aqua_train_size),
+        "aqua_validation_size": int(args.aqua_validation_size),
+        "aqua_test_size": int(args.aqua_test_size),
+        "aqua_split_seed": int(args.aqua_split_seed),
         "method": "univariate_logit_feature_steering",
         "feature_names": FEATURE_NAMES,
         "target_lower_quantile": TARGET_LOWER_QUANTILE,

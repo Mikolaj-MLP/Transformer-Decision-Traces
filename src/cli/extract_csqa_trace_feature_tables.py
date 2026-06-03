@@ -31,7 +31,7 @@ from src.csqa.common import (  # noqa: E402
     get_decoder_layers,
     get_final_norm_module,
 )
-from src.data.load_csqa import load_csqa  # noqa: E402
+from src.data.load_mcqa import SUPPORTED_DATASETS, load_mcqa  # noqa: E402
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
@@ -57,11 +57,11 @@ def slugify_model_id(model_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", model_id).strip("-")
 
 
-def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
+def resolve_out_dir(out_dir: str | None, model_id: str, dataset_name: str) -> Path:
     root = repo_root()
     if out_dir is None:
-        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_trace_feature_tables"
-        return root / "data" / "generated" / "csqa_trace_feature_tables" / run_name
+        run_name = f"{now_id()}_{slugify_model_id(model_id)}_{dataset_name}_trace_feature_tables"
+        return root / "data" / "generated" / "trace_feature_tables" / run_name
     path = Path(out_dir)
     return path if path.is_absolute() else (root / path)
 
@@ -96,6 +96,7 @@ def prepare_readout_context(
     input_device: torch.device,
     num_layers: int,
     max_seq_len: int,
+    probe_rows: pd.DataFrame | None = None,
 ) -> dict[str, object]:
     final_norm = get_final_norm_module(model)
     lm_head_weight = model.lm_head.weight.detach()
@@ -106,7 +107,10 @@ def prepare_readout_context(
     answer_id_tensor_lm_head = answer_id_tensor_cpu.to(lm_head_device)
     answer_choice_weight = lm_head_weight.index_select(0, answer_id_tensor_lm_head)
 
-    probe_rows = load_csqa(split="validation", limit=1).copy()
+    if probe_rows is None:
+        probe_rows = load_mcqa("csqa", split="validation", limit=1).copy()
+    else:
+        probe_rows = probe_rows.iloc[:1].copy()
     probe_cpu = encode_prompts(probe_rows["text"].tolist(), tok, max_seq_len)
     probe_pos = int(probe_cpu["decision_pos"][0].item())
     probe_batch = {
@@ -455,19 +459,40 @@ def build_headwise_attention_entropy_table(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", type=str, default="csqa", choices=SUPPORTED_DATASETS)
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
+    parser.add_argument("--aqua-train-size", type=int, default=10_000)
+    parser.add_argument("--aqua-validation-size", type=int, default=5_000)
+    parser.add_argument("--aqua-test-size", type=int, default=5_000)
+    parser.add_argument("--aqua-split-seed", type=int, default=42)
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    train_rows = load_csqa(split="train", limit=args.train_limit).copy()
-    validation_rows = load_csqa(split="validation", limit=args.validation_limit).copy()
+    train_rows = load_mcqa(
+        args.dataset,
+        split="train",
+        limit=args.train_limit,
+        aqua_train_size=args.aqua_train_size,
+        aqua_validation_size=args.aqua_validation_size,
+        aqua_test_size=args.aqua_test_size,
+        aqua_split_seed=args.aqua_split_seed,
+    ).copy()
+    validation_rows = load_mcqa(
+        args.dataset,
+        split="validation",
+        limit=args.validation_limit,
+        aqua_train_size=args.aqua_train_size,
+        aqua_validation_size=args.aqua_validation_size,
+        aqua_test_size=args.aqua_test_size,
+        aqua_split_seed=args.aqua_split_seed,
+    ).copy()
     for frame in [train_rows, validation_rows]:
         frame["prompt_len_chars"] = frame["text"].str.len()
 
@@ -500,6 +525,7 @@ def main(argv: list[str] | None = None) -> None:
         input_device=input_device,
         num_layers=num_layers,
         max_seq_len=args.max_seq_len,
+        probe_rows=validation_rows,
     )
     final_norm = readout_ctx["final_norm"]
     answer_choice_weight = readout_ctx["answer_choice_weight"]
@@ -585,7 +611,7 @@ def main(argv: list[str] | None = None) -> None:
 
     examples_df = pd.DataFrame(train_cache["example_rows"] + validation_cache["example_rows"])
 
-    out_dir = resolve_out_dir(args.out_dir, args.model_id)
+    out_dir = resolve_out_dir(args.out_dir, args.model_id, args.dataset)
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -597,11 +623,16 @@ def main(argv: list[str] | None = None) -> None:
     torch.save(lens_state_dicts, out_dir / "tuned_lens_state.pt")
 
     run_config = {
+        "dataset": args.dataset,
         "model_id": args.model_id,
         "max_seq_len": int(args.max_seq_len),
         "seed": int(args.seed),
         "train_limit": None if args.train_limit is None else int(args.train_limit),
         "validation_limit": None if args.validation_limit is None else int(args.validation_limit),
+        "aqua_train_size": int(args.aqua_train_size),
+        "aqua_validation_size": int(args.aqua_validation_size),
+        "aqua_test_size": int(args.aqua_test_size),
+        "aqua_split_seed": int(args.aqua_split_seed),
         "num_layers": int(num_layers),
         "hidden_size": int(hidden_size),
         "extract_batch_size": EXTRACT_BATCH_SIZE,

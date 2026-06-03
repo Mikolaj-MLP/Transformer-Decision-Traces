@@ -9,9 +9,9 @@ QWEN25_INSTRUCT_MODELS = {
 }
 
 
-LLAMA31_INSTRUCT_MODELS = {
-    "8B": "meta-llama/Llama-3.1-8B-Instruct",
-    "70B": "meta-llama/Llama-3.1-70B-Instruct",
+LLAMA32_INSTRUCT_MODELS = {
+    "1B": "meta-llama/Llama-3.2-1B-Instruct",
+    "3B": "meta-llama/Llama-3.2-3B-Instruct",
 }
 
 
@@ -22,8 +22,8 @@ def resolve_qwen25_instruct_model_id(size: str) -> str:
         raise ValueError(f"Unsupported Qwen 2.5 Instruct size: {size}") from e
 
 
-def resolve_llama31_instruct_model_id(size: str) -> str:
+def resolve_llama32_instruct_model_id(size: str) -> str:
     try:
-        return LLAMA31_INSTRUCT_MODELS[str(size).upper()]
+        return LLAMA32_INSTRUCT_MODELS[str(size).upper()]
     except KeyError as e:
-        raise ValueError(f"Unsupported Llama 3.1 Instruct size: {size}") from e
+        raise ValueError(f"Unsupported Llama 3.2 Instruct size: {size}") from e

@@ -17,9 +17,9 @@ AQUA_URLS = {
     "official_test": "https://raw.githubusercontent.com/google-deepmind/AQuA/master/test.json",
 }
 
-DEFAULT_AQUA_TRAIN_SIZE = 10_000
-DEFAULT_AQUA_VALIDATION_SIZE = 5_000
-DEFAULT_AQUA_TEST_SIZE = 5_000
+DEFAULT_AQUA_TRAIN_SIZE = 4_000
+DEFAULT_AQUA_VALIDATION_SIZE = 1_500
+DEFAULT_AQUA_TEST_SIZE = 4_000
 DEFAULT_AQUA_SPLIT_SEED = 42
 LETTERS = ["A", "B", "C", "D", "E"]
 

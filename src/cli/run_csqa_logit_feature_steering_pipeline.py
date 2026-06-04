@@ -64,6 +64,12 @@ from src.csqa.common import (  # noqa: E402
     unpack_output_hidden,
 )
 from src.data.load_mcqa import SUPPORTED_DATASETS, load_mcqa  # noqa: E402
+from src.data.load_aqua_rat import (  # noqa: E402
+    DEFAULT_AQUA_SPLIT_SEED,
+    DEFAULT_AQUA_TEST_SIZE,
+    DEFAULT_AQUA_TRAIN_SIZE,
+    DEFAULT_AQUA_VALIDATION_SIZE,
+)
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
@@ -650,10 +656,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
-    parser.add_argument("--aqua-train-size", type=int, default=10_000)
-    parser.add_argument("--aqua-validation-size", type=int, default=5_000)
-    parser.add_argument("--aqua-test-size", type=int, default=5_000)
-    parser.add_argument("--aqua-split-seed", type=int, default=42)
+    parser.add_argument("--aqua-train-size", type=int, default=DEFAULT_AQUA_TRAIN_SIZE)
+    parser.add_argument("--aqua-validation-size", type=int, default=DEFAULT_AQUA_VALIDATION_SIZE)
+    parser.add_argument("--aqua-test-size", type=int, default=DEFAULT_AQUA_TEST_SIZE)
+    parser.add_argument("--aqua-split-seed", type=int, default=DEFAULT_AQUA_SPLIT_SEED)
     args = parser.parse_args(argv)
 
     torch.manual_seed(args.seed)

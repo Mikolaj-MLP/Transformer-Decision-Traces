@@ -13,6 +13,8 @@ from src.csqa.model_presets import resolve_qwen25_instruct_model_id
 
 
 DEFAULT_SIZES = ["0.5B", "3B", "7B"]
+DEFAULT_FIT_LIMIT = "1000"
+DEFAULT_EVAL_LIMIT = "2500"
 
 
 def main() -> None:
@@ -34,7 +36,17 @@ def main() -> None:
     for size in sizes:
         model_id = resolve_qwen25_instruct_model_id(size)
         print(f"[suite] starting {size} -> {model_id}")
-        base_main(["--model-id", model_id, *passthrough])
+        base_main(
+            [
+                "--model-id",
+                model_id,
+                "--fit-limit",
+                DEFAULT_FIT_LIMIT,
+                "--eval-limit",
+                DEFAULT_EVAL_LIMIT,
+                *passthrough,
+            ]
+        )
 
 
 if __name__ == "__main__":

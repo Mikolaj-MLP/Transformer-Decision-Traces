@@ -33,6 +33,7 @@ from src.cli.run_csqa_logit_feature_steering_pipeline import (  # noqa: E402
     build_feature_table,
     build_feature_target_stats,
     compute_feature_steering_delta,
+    latter_half_layer_numbers,
     resolve_hf_token,
 )
 from src.csqa.common import (  # noqa: E402
@@ -88,6 +89,7 @@ def run_eval_policy(
     vocab_size: int,
     max_seq_len: int,
     eval_split_name: str,
+    active_layer_numbers: list[int],
 ) -> pd.DataFrame:
     feature_lookup = (
         eval_feature_df.set_index(["example_id", "feature_name", "layer_number"])["feature_value"].sort_index()
@@ -101,11 +103,11 @@ def run_eval_policy(
     example_id_to_index = {example_id: idx for idx, example_id in enumerate(example_ids)}
 
     rows: list[dict[str, object]] = []
-    total_steps = len(decoder_layers) * len(FEATURE_NAMES)
+    total_steps = len(active_layer_numbers) * len(FEATURE_NAMES)
 
     with tqdm(total=total_steps, desc=f"{eval_split_name} policy sweep") as pbar:
         for feature_name in FEATURE_NAMES:
-            for layer_number in range(1, len(decoder_layers) + 1):
+            for layer_number in active_layer_numbers:
                 steering_module = decoder_layers[layer_number - 1]
                 target_row = target_lookup.loc[(feature_name, layer_number)]
                 target_lower = float(target_row["target_lower"])
@@ -315,6 +317,7 @@ def main(argv: list[str] | None = None) -> None:
     input_device = get_input_device(model)
     decoder_layers = get_decoder_layers(model)
     num_layers = len(decoder_layers)
+    active_layer_numbers = latter_half_layer_numbers(num_layers)
     vocab_size = int(model.config.vocab_size)
 
     readout_ctx = prepare_readout_context(
@@ -372,6 +375,7 @@ def main(argv: list[str] | None = None) -> None:
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
         input_device=input_device,
         vocab_size=vocab_size,
+        active_layer_numbers=active_layer_numbers,
     )
     eval_feature_df = build_feature_table(
         split_name=args.eval_split,
@@ -381,6 +385,7 @@ def main(argv: list[str] | None = None) -> None:
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
         input_device=input_device,
         vocab_size=vocab_size,
+        active_layer_numbers=active_layer_numbers,
     )
 
     target_stats_df = build_feature_target_stats(fit_feature_df)
@@ -401,6 +406,7 @@ def main(argv: list[str] | None = None) -> None:
         vocab_size=vocab_size,
         max_seq_len=args.max_seq_len,
         eval_split_name=args.eval_split,
+        active_layer_numbers=active_layer_numbers,
     )
 
     out_dir = resolve_out_dir(args.out_dir, args.model_id)
@@ -426,6 +432,8 @@ def main(argv: list[str] | None = None) -> None:
         "eval_limit": eval_limit,
         "method": "feature_band_steering",
         "feature_names": FEATURE_NAMES,
+        "active_layer_numbers": active_layer_numbers,
+        "layer_selection_rule": "latter_half",
         "target_lower_quantile": TARGET_LOWER_QUANTILE,
         "target_upper_quantile": TARGET_UPPER_QUANTILE,
         "gate_rule": "intervene_if_feature_outside_correct_trace_iqr",

@@ -76,9 +76,12 @@ LETTERS = ["A", "B", "C", "D", "E"]
 FEATURE_NAMES = [
     "answer_choice_entropy_normalized",
     "answer_choice_top1_top2_logit_gap",
-    "answer_choice_top1_probability",
     "answer_choice_varentropy",
     "full_vocab_entropy_normalized",
+]
+CONTROL_INTERVENTION_TYPES = [
+    "wrong_direction",
+    "random_perp",
 ]
 INTERVENTION_BATCH_SIZE = 2
 DETECTOR_C_GRID = np.logspace(-3, 2, 12)
@@ -133,6 +136,11 @@ def choice_logits_to_varentropy(choice_logits: np.ndarray) -> np.ndarray:
     surprisal = -log_probs
     entropy = (probs * surprisal).sum(axis=1, keepdims=True)
     return (probs * (surprisal - entropy) ** 2).sum(axis=1)
+
+
+def latter_half_layer_numbers(num_layers: int) -> list[int]:
+    start_layer = (num_layers // 2) + 1
+    return list(range(start_layer, num_layers + 1))
 
 
 def compute_feature_tensor(
@@ -198,13 +206,20 @@ def build_feature_table(
     answer_id_tensor_lm_head: torch.Tensor,
     input_device: torch.device,
     vocab_size: int,
+    active_layer_numbers: list[int] | None = None,
 ) -> pd.DataFrame:
     hidden = cache["hidden"]
     clean_is_correct = cache["clean_is_correct"]
     example_rows = pd.DataFrame(cache["example_rows"])[["example_id", "split"]]
     rows: list[dict[str, object]] = []
 
-    for layer_index in tqdm(range(hidden.shape[1]), desc=f"{split_name} feature extraction"):
+    layer_indices = (
+        [layer_number - 1 for layer_number in active_layer_numbers]
+        if active_layer_numbers is not None
+        else list(range(hidden.shape[1]))
+    )
+
+    for layer_index in tqdm(layer_indices, desc=f"{split_name} feature extraction"):
         layer_hidden = hidden[:, layer_index, :]
         feature_blocks: dict[str, list[np.ndarray]] = {feature_name: [] for feature_name in FEATURE_NAMES}
 
@@ -461,15 +476,6 @@ def compute_feature_steering_delta(
             grad_norms.append(grad_norm)
 
         delta = torch.stack(deltas, dim=0)
-        steered_feature = compute_feature_from_token_hidden(
-            base + delta,
-            feature_name=feature_name,
-            layer_index_0based=layer_index_0based,
-            maybe_apply_final_norm=maybe_apply_final_norm,
-            lm_head_weight=lm_head_weight,
-            answer_id_tensor_lm_head=answer_id_tensor_lm_head,
-            vocab_size=vocab_size,
-        ).detach()
 
     token_hidden_l2 = token_hidden.detach().float().norm(dim=-1)
     delta_l2 = delta.detach().float().norm(dim=-1)
@@ -477,11 +483,130 @@ def compute_feature_steering_delta(
 
     return {
         "delta": delta.detach(),
-        "steered_feature_value_local": steered_feature.cpu().numpy().astype(np.float32),
+        "current_feature_value": current_feature.detach().cpu().numpy().astype(np.float32),
+        "target_feature_value": target_feature.detach().cpu().numpy().astype(np.float32),
+        "desired_shift": desired_shift.detach().cpu().numpy().astype(np.float32),
         "grad_l2_norm": np.asarray(grad_norms, dtype=np.float32),
         "delta_l2_norm": delta_l2.detach().cpu().numpy().astype(np.float32),
         "delta_over_token_hidden_l2": delta_over_hidden.detach().cpu().numpy().astype(np.float32),
         "token_hidden_l2_norm": token_hidden_l2.detach().cpu().numpy().astype(np.float32),
+    }
+
+
+def summarize_delta_application(
+    token_hidden: torch.Tensor,
+    *,
+    delta: torch.Tensor,
+    feature_name: str,
+    layer_index_0based: int,
+    maybe_apply_final_norm,
+    lm_head_weight: torch.Tensor,
+    answer_id_tensor_lm_head: torch.Tensor,
+    vocab_size: int,
+    grad_l2_norm: np.ndarray,
+) -> dict[str, object]:
+    steered_feature = compute_feature_from_token_hidden(
+        token_hidden + delta,
+        feature_name=feature_name,
+        layer_index_0based=layer_index_0based,
+        maybe_apply_final_norm=maybe_apply_final_norm,
+        lm_head_weight=lm_head_weight,
+        answer_id_tensor_lm_head=answer_id_tensor_lm_head,
+        vocab_size=vocab_size,
+    ).detach()
+
+    token_hidden_l2 = token_hidden.detach().float().norm(dim=-1)
+    delta_l2 = delta.detach().float().norm(dim=-1)
+    delta_over_hidden = delta_l2 / token_hidden_l2.clamp_min(1e-12)
+
+    return {
+        "steered_feature_value_local": steered_feature.cpu().numpy().astype(np.float32),
+        "grad_l2_norm": np.asarray(grad_l2_norm, dtype=np.float32),
+        "delta_l2_norm": delta_l2.detach().cpu().numpy().astype(np.float32),
+        "delta_over_token_hidden_l2": delta_over_hidden.detach().cpu().numpy().astype(np.float32),
+        "token_hidden_l2_norm": token_hidden_l2.detach().cpu().numpy().astype(np.float32),
+    }
+
+
+def build_random_perp_delta(
+    targeted_delta: torch.Tensor,
+    *,
+    intervention_mask: np.ndarray,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    random_delta = torch.zeros_like(targeted_delta)
+    for batch_index in range(targeted_delta.shape[0]):
+        if not bool(intervention_mask[batch_index]):
+            continue
+
+        basis = targeted_delta[batch_index].detach().float().cpu()
+        basis_norm = float(basis.norm().item())
+        if (not math.isfinite(basis_norm)) or basis_norm <= 1e-12:
+            continue
+
+        random_vec = None
+        for _ in range(4):
+            candidate = torch.randn(basis.shape, generator=generator, dtype=torch.float32)
+            candidate = candidate - (torch.dot(candidate, basis) / torch.dot(basis, basis)) * basis
+            candidate_norm = float(candidate.norm().item())
+            if math.isfinite(candidate_norm) and candidate_norm > 1e-12:
+                random_vec = candidate / candidate_norm
+                break
+
+        if random_vec is None:
+            continue
+
+        random_delta[batch_index] = (basis_norm * random_vec).to(
+            device=targeted_delta.device,
+            dtype=targeted_delta.dtype,
+        )
+
+    return random_delta
+
+
+def run_single_intervention_forward(
+    *,
+    batch: dict[str, torch.Tensor],
+    decision_pos: torch.Tensor,
+    model: AutoModelForCausalLM,
+    steering_module,
+    delta: torch.Tensor,
+    true_choice_idx: torch.Tensor,
+    answer_id_tensor_cpu: torch.Tensor,
+) -> dict[str, np.ndarray]:
+    def steering_hook(module, inputs, output):
+        hidden = unpack_output_hidden(output)
+        row_idx = torch.arange(hidden.shape[0], device=hidden.device)
+        hidden_out = hidden.clone()
+        hidden_out[row_idx, decision_pos] = hidden[row_idx, decision_pos] + delta.to(
+            hidden.device,
+            dtype=hidden.dtype,
+        )
+        return repack_output_hidden(output, hidden_out)
+
+    handle = steering_module.register_forward_hook(steering_hook)
+    try:
+        with torch.no_grad():
+            out = model(**batch, return_dict=True, use_cache=False)
+    finally:
+        handle.remove()
+
+    full_logits = select_full_logits_at_decision(out.logits, decision_pos)
+    metrics = summarize_decision_logits(
+        full_logits,
+        true_choice_idx,
+        answer_id_tensor_cpu.to(full_logits.device),
+    )
+    choice_logits_cpu = metrics["choice_logits"].detach().cpu().numpy().astype(np.float32)
+    best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
+    masked_logits = full_logits.clone()
+    masked_logits[:, answer_id_tensor_cpu.to(full_logits.device)] = -torch.inf
+    best_non_choice_token_id_cpu = torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
+
+    return {
+        "choice_logits": choice_logits_cpu,
+        "best_non_choice_logit": best_non_choice_logit_cpu,
+        "best_non_choice_token_id": best_non_choice_token_id_cpu,
     }
 
 
@@ -502,7 +627,9 @@ def run_validation_policy(
     vocab_size: int,
     max_seq_len: int,
     eval_split_name: str,
-) -> pd.DataFrame:
+    random_generator: torch.Generator,
+    active_layer_numbers: list[int],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     detector_lookup = eval_detector_outputs_df.set_index(["example_id", "feature_name", "layer_number"])
     target_lookup = target_stats_df.set_index(["feature_name", "layer_number"])
 
@@ -512,12 +639,13 @@ def run_validation_policy(
     example_ids = [row["example_id"] for row in eval_cache["example_rows"]]
     example_id_to_index = {example_id: idx for idx, example_id in enumerate(example_ids)}
 
-    rows: list[dict[str, object]] = []
-    total_steps = len(decoder_layers) * len(FEATURE_NAMES)
+    targeted_rows: list[dict[str, object]] = []
+    control_rows: list[dict[str, object]] = []
+    total_steps = len(active_layer_numbers) * len(FEATURE_NAMES)
 
     with tqdm(total=total_steps, desc=f"{eval_split_name} policy sweep") as pbar:
         for feature_name in FEATURE_NAMES:
-            for layer_number in range(1, len(decoder_layers) + 1):
+            for layer_number in active_layer_numbers:
                 steering_module = decoder_layers[layer_number - 1]
                 target_row = target_lookup.loc[(feature_name, layer_number)]
                 target_lower = float(target_row["target_lower"])
@@ -541,9 +669,10 @@ def run_validation_policy(
                     if not bool(batch_detector_pred.any()):
                         for batch_index, row in batch_df.iterrows():
                             global_index = batch_indices[batch_index]
-                            rows.append(
+                            targeted_rows.append(
                                 {
                                     "example_id": row["example_id"],
+                                    "intervention_type": "targeted",
                                     "feature_name": feature_name,
                                     "layer_number": layer_number,
                                     "detector_probability_error": float(batch_detector_prob[batch_index]),
@@ -561,6 +690,28 @@ def run_validation_policy(
                                     "steered_logit_E": float(validation_choice_logits[global_index, 4]),
                                 }
                             )
+                            for intervention_type in CONTROL_INTERVENTION_TYPES:
+                                control_rows.append(
+                                    {
+                                        "example_id": row["example_id"],
+                                        "intervention_type": intervention_type,
+                                        "feature_name": feature_name,
+                                        "layer_number": layer_number,
+                                        "detector_probability_error": float(batch_detector_prob[batch_index]),
+                                        "steered_feature_value_local": np.nan,
+                                        "grad_l2_norm": 0.0,
+                                        "delta_l2_norm": 0.0,
+                                        "delta_over_token_hidden_l2": 0.0,
+                                        "token_hidden_l2_norm": np.nan,
+                                        "steered_best_non_choice_token_id": int(validation_best_non_choice_token_id[global_index]),
+                                        "steered_best_non_choice_logit": float(validation_best_non_choice_logit[global_index]),
+                                        "steered_logit_A": float(validation_choice_logits[global_index, 0]),
+                                        "steered_logit_B": float(validation_choice_logits[global_index, 1]),
+                                        "steered_logit_C": float(validation_choice_logits[global_index, 2]),
+                                        "steered_logit_D": float(validation_choice_logits[global_index, 3]),
+                                        "steered_logit_E": float(validation_choice_logits[global_index, 4]),
+                                    }
+                                )
                         continue
 
                     batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, max_seq_len)
@@ -573,76 +724,143 @@ def run_validation_policy(
                         dtype=torch.long,
                         device=input_device,
                     )
-                    steering_stats: dict[str, np.ndarray] = {}
-
-                    def steering_hook(module, inputs, output):
-                        hidden = unpack_output_hidden(output)
-                        row_idx = torch.arange(hidden.shape[0], device=hidden.device)
-                        token_hidden = hidden[row_idx, decision_pos]
-                        stats = compute_feature_steering_delta(
-                            token_hidden,
-                            feature_name=feature_name,
-                            layer_index_0based=layer_number - 1,
-                            maybe_apply_final_norm=maybe_apply_final_norm,
-                            lm_head_weight=lm_head_weight,
-                            answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(hidden.device),
-                            vocab_size=vocab_size,
-                            target_lower=target_lower,
-                            target_upper=target_upper,
-                            intervention_mask=batch_detector_pred,
-                        )
-                        steering_stats.update({key: value for key, value in stats.items() if key != "delta"})
-                        hidden_out = hidden.clone()
-                        hidden_out[row_idx, decision_pos] = token_hidden + stats["delta"].to(hidden.device, dtype=hidden.dtype)
-                        return repack_output_hidden(output, hidden_out)
-
-                    handle = steering_module.register_forward_hook(steering_hook)
-                    try:
-                        with torch.no_grad():
-                            out = model(**batch, return_dict=True, use_cache=False)
-                    finally:
-                        handle.remove()
-
-                    full_logits = select_full_logits_at_decision(out.logits, decision_pos)
-                    metrics = summarize_decision_logits(
-                        full_logits,
-                        true_choice_idx,
-                        answer_id_tensor_cpu.to(full_logits.device),
+                    token_hidden = eval_cache["hidden"][batch_indices, layer_number - 1, :].to(input_device)
+                    targeted_plan = compute_feature_steering_delta(
+                        token_hidden,
+                        feature_name=feature_name,
+                        layer_index_0based=layer_number - 1,
+                        maybe_apply_final_norm=maybe_apply_final_norm,
+                        lm_head_weight=lm_head_weight,
+                        answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
+                        vocab_size=vocab_size,
+                        target_lower=target_lower,
+                        target_upper=target_upper,
+                        intervention_mask=batch_detector_pred,
                     )
-                    choice_logits_cpu = metrics["choice_logits"].detach().cpu().numpy().astype(np.float32)
-                    best_non_choice_logit_cpu = metrics["best_non_choice_logit"].detach().cpu().numpy().astype(np.float32)
-                    masked_logits = full_logits.clone()
-                    masked_logits[:, answer_id_tensor_cpu.to(full_logits.device)] = -torch.inf
-                    best_non_choice_token_id_cpu = torch.argmax(masked_logits, dim=-1).detach().cpu().numpy().astype(np.int64)
+                    targeted_delta = targeted_plan["delta"]
+                    wrong_delta = -targeted_delta
+                    random_perp_delta = build_random_perp_delta(
+                        targeted_delta,
+                        intervention_mask=batch_detector_pred,
+                        generator=random_generator,
+                    )
+
+                    targeted_stats = summarize_delta_application(
+                        token_hidden,
+                        delta=targeted_delta,
+                        feature_name=feature_name,
+                        layer_index_0based=layer_number - 1,
+                        maybe_apply_final_norm=maybe_apply_final_norm,
+                        lm_head_weight=lm_head_weight,
+                        answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
+                        vocab_size=vocab_size,
+                        grad_l2_norm=targeted_plan["grad_l2_norm"],
+                    )
+                    wrong_stats = summarize_delta_application(
+                        token_hidden,
+                        delta=wrong_delta,
+                        feature_name=feature_name,
+                        layer_index_0based=layer_number - 1,
+                        maybe_apply_final_norm=maybe_apply_final_norm,
+                        lm_head_weight=lm_head_weight,
+                        answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
+                        vocab_size=vocab_size,
+                        grad_l2_norm=targeted_plan["grad_l2_norm"],
+                    )
+                    random_stats = summarize_delta_application(
+                        token_hidden,
+                        delta=random_perp_delta,
+                        feature_name=feature_name,
+                        layer_index_0based=layer_number - 1,
+                        maybe_apply_final_norm=maybe_apply_final_norm,
+                        lm_head_weight=lm_head_weight,
+                        answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
+                        vocab_size=vocab_size,
+                        grad_l2_norm=targeted_plan["grad_l2_norm"],
+                    )
+
+                    targeted_outputs = run_single_intervention_forward(
+                        batch=batch,
+                        decision_pos=decision_pos,
+                        model=model,
+                        steering_module=steering_module,
+                        delta=targeted_delta,
+                        true_choice_idx=true_choice_idx,
+                        answer_id_tensor_cpu=answer_id_tensor_cpu,
+                    )
+                    wrong_outputs = run_single_intervention_forward(
+                        batch=batch,
+                        decision_pos=decision_pos,
+                        model=model,
+                        steering_module=steering_module,
+                        delta=wrong_delta,
+                        true_choice_idx=true_choice_idx,
+                        answer_id_tensor_cpu=answer_id_tensor_cpu,
+                    )
+                    random_outputs = run_single_intervention_forward(
+                        batch=batch,
+                        decision_pos=decision_pos,
+                        model=model,
+                        steering_module=steering_module,
+                        delta=random_perp_delta,
+                        true_choice_idx=true_choice_idx,
+                        answer_id_tensor_cpu=answer_id_tensor_cpu,
+                    )
 
                     for batch_index, row in batch_df.iterrows():
-                        rows.append(
+                        targeted_rows.append(
                             {
                                 "example_id": row["example_id"],
+                                "intervention_type": "targeted",
                                 "feature_name": feature_name,
                                 "layer_number": layer_number,
                                 "detector_probability_error": float(batch_detector_prob[batch_index]),
-                                "steered_feature_value_local": float(steering_stats["steered_feature_value_local"][batch_index]),
-                                "grad_l2_norm": float(steering_stats["grad_l2_norm"][batch_index]),
-                                "delta_l2_norm": float(steering_stats["delta_l2_norm"][batch_index]),
-                                "delta_over_token_hidden_l2": float(steering_stats["delta_over_token_hidden_l2"][batch_index]),
-                                "token_hidden_l2_norm": float(steering_stats["token_hidden_l2_norm"][batch_index]),
-                                "steered_best_non_choice_token_id": int(best_non_choice_token_id_cpu[batch_index]),
-                                "steered_best_non_choice_logit": float(best_non_choice_logit_cpu[batch_index]),
-                                "steered_logit_A": float(choice_logits_cpu[batch_index, 0]),
-                                "steered_logit_B": float(choice_logits_cpu[batch_index, 1]),
-                                "steered_logit_C": float(choice_logits_cpu[batch_index, 2]),
-                                "steered_logit_D": float(choice_logits_cpu[batch_index, 3]),
-                                "steered_logit_E": float(choice_logits_cpu[batch_index, 4]),
+                                "steered_feature_value_local": float(targeted_stats["steered_feature_value_local"][batch_index]),
+                                "grad_l2_norm": float(targeted_stats["grad_l2_norm"][batch_index]),
+                                "delta_l2_norm": float(targeted_stats["delta_l2_norm"][batch_index]),
+                                "delta_over_token_hidden_l2": float(targeted_stats["delta_over_token_hidden_l2"][batch_index]),
+                                "token_hidden_l2_norm": float(targeted_stats["token_hidden_l2_norm"][batch_index]),
+                                "steered_best_non_choice_token_id": int(targeted_outputs["best_non_choice_token_id"][batch_index]),
+                                "steered_best_non_choice_logit": float(targeted_outputs["best_non_choice_logit"][batch_index]),
+                                "steered_logit_A": float(targeted_outputs["choice_logits"][batch_index, 0]),
+                                "steered_logit_B": float(targeted_outputs["choice_logits"][batch_index, 1]),
+                                "steered_logit_C": float(targeted_outputs["choice_logits"][batch_index, 2]),
+                                "steered_logit_D": float(targeted_outputs["choice_logits"][batch_index, 3]),
+                                "steered_logit_E": float(targeted_outputs["choice_logits"][batch_index, 4]),
                             }
                         )
+                        for intervention_type, stats_dict, output_dict in [
+                            ("wrong_direction", wrong_stats, wrong_outputs),
+                            ("random_perp", random_stats, random_outputs),
+                        ]:
+                            control_rows.append(
+                                {
+                                    "example_id": row["example_id"],
+                                    "intervention_type": intervention_type,
+                                    "feature_name": feature_name,
+                                    "layer_number": layer_number,
+                                    "detector_probability_error": float(batch_detector_prob[batch_index]),
+                                    "steered_feature_value_local": float(stats_dict["steered_feature_value_local"][batch_index]),
+                                    "grad_l2_norm": float(stats_dict["grad_l2_norm"][batch_index]),
+                                    "delta_l2_norm": float(stats_dict["delta_l2_norm"][batch_index]),
+                                    "delta_over_token_hidden_l2": float(stats_dict["delta_over_token_hidden_l2"][batch_index]),
+                                    "token_hidden_l2_norm": float(stats_dict["token_hidden_l2_norm"][batch_index]),
+                                    "steered_best_non_choice_token_id": int(output_dict["best_non_choice_token_id"][batch_index]),
+                                    "steered_best_non_choice_logit": float(output_dict["best_non_choice_logit"][batch_index]),
+                                    "steered_logit_A": float(output_dict["choice_logits"][batch_index, 0]),
+                                    "steered_logit_B": float(output_dict["choice_logits"][batch_index, 1]),
+                                    "steered_logit_C": float(output_dict["choice_logits"][batch_index, 2]),
+                                    "steered_logit_D": float(output_dict["choice_logits"][batch_index, 3]),
+                                    "steered_logit_E": float(output_dict["choice_logits"][batch_index, 4]),
+                                }
+                            )
 
                 pbar.update(1)
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(targeted_rows), pd.DataFrame(control_rows)
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
@@ -734,6 +952,7 @@ def main(argv: list[str] | None = None) -> None:
     input_device = get_input_device(model)
     decoder_layers = get_decoder_layers(model)
     num_layers = len(decoder_layers)
+    active_layer_numbers = latter_half_layer_numbers(num_layers)
     vocab_size = int(model.config.vocab_size)
 
     readout_ctx = prepare_readout_context(
@@ -791,6 +1010,7 @@ def main(argv: list[str] | None = None) -> None:
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
         input_device=input_device,
         vocab_size=vocab_size,
+        active_layer_numbers=active_layer_numbers,
     )
     eval_feature_df = build_feature_table(
         split_name=args.eval_split,
@@ -800,6 +1020,7 @@ def main(argv: list[str] | None = None) -> None:
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
         input_device=input_device,
         vocab_size=vocab_size,
+        active_layer_numbers=active_layer_numbers,
     )
 
     detector_models, detector_coefficients_df, detector_outputs_df = fit_univariate_detectors(
@@ -812,7 +1033,10 @@ def main(argv: list[str] | None = None) -> None:
 
     target_stats_df = build_feature_target_stats(fit_feature_df)
 
-    validation_policy_outputs_raw_df = run_validation_policy(
+    control_random_generator = torch.Generator(device="cpu")
+    control_random_generator.manual_seed(args.seed)
+
+    validation_policy_outputs_raw_df, validation_policy_control_outputs_raw_df = run_validation_policy(
         eval_rows=eval_rows,
         eval_cache=eval_cache,
         eval_detector_outputs_df=detector_outputs_df.loc[detector_outputs_df["split"].eq(args.eval_split)].copy(),
@@ -828,6 +1052,8 @@ def main(argv: list[str] | None = None) -> None:
         vocab_size=vocab_size,
         max_seq_len=args.max_seq_len,
         eval_split_name=args.eval_split,
+        random_generator=control_random_generator,
+        active_layer_numbers=active_layer_numbers,
     )
 
     out_dir = resolve_out_dir(args.out_dir, args.model_id, args.dataset)
@@ -843,6 +1069,10 @@ def main(argv: list[str] | None = None) -> None:
     detector_outputs_df.to_parquet(out_dir / "detector_outputs.parquet", index=False)
     target_stats_df.to_parquet(out_dir / "feature_target_stats.parquet", index=False)
     validation_policy_outputs_raw_df.to_parquet(out_dir / f"{args.eval_split}_policy_outputs_raw.parquet", index=False)
+    validation_policy_control_outputs_raw_df.to_parquet(
+        out_dir / f"{args.eval_split}_policy_control_outputs_raw.parquet",
+        index=False,
+    )
 
     run_config = {
         "dataset": args.dataset,
@@ -861,6 +1091,9 @@ def main(argv: list[str] | None = None) -> None:
         "detector_type": "l1_logistic_regression_cv",
         "detector_class_weight": "balanced",
         "feature_names": FEATURE_NAMES,
+        "active_layer_numbers": active_layer_numbers,
+        "layer_selection_rule": "latter_half",
+        "control_intervention_types": CONTROL_INTERVENTION_TYPES,
         "target_lower_quantile": TARGET_LOWER_QUANTILE,
         "target_upper_quantile": TARGET_UPPER_QUANTILE,
         "extract_batch_size": EXTRACT_BATCH_SIZE,

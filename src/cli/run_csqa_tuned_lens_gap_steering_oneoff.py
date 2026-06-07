@@ -55,6 +55,7 @@ from src.cli.run_csqa_adaptive_contrastive_pipeline import (  # noqa: E402
     get_input_device,
     prepare_readout_context,
 )
+from src.cli.extract_csqa_trace_feature_tables import train_tuned_lenses  # noqa: E402
 from src.csqa.common import (  # noqa: E402
     encode_prompts,
     get_decoder_layers,
@@ -67,12 +68,8 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
-FEATURE_NAMES = [
-    "answer_choice_entropy_normalized",
-    "answer_choice_top1_top2_logit_gap",
-    "answer_choice_varentropy",
-    "full_vocab_entropy_normalized",
-]
+FEATURE_NAME = "answer_choice_top1_top2_logit_gap"
+FEATURE_NAMES = [FEATURE_NAME]
 CONTROL_INTERVENTION_TYPES = [
     "wrong_direction",
     "random_perp",
@@ -101,8 +98,8 @@ def slugify_model_id(model_id: str) -> str:
 def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
     root = repo_root()
     if out_dir is None:
-        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_logit_feature_steering_pipeline"
-        return root / "data" / "generated" / "logit_feature_steering_pipeline" / run_name
+        run_name = f"{now_id()}_{slugify_model_id(model_id)}_csqa_tuned_lens_gap_steering_oneoff"
+        return root / "data" / "generated" / "tuned_lens_gap_steering_oneoff" / run_name
     path = Path(out_dir)
     return path if path.is_absolute() else (root / path)
 
@@ -191,10 +188,29 @@ def summarize_logit_features(
     return out
 
 
+def compute_tuned_lens_readout(
+    hidden_batch: torch.Tensor,
+    *,
+    layer_index_0based: int,
+    layer_lens,
+    final_norm,
+    maybe_apply_final_norm,
+) -> torch.Tensor:
+    if layer_lens is None:
+        return maybe_apply_final_norm(hidden_batch, layer_index_0based)
+
+    readout = layer_lens(hidden_batch)
+    if final_norm is not None:
+        readout = final_norm(readout)
+    return readout
+
+
 def build_feature_table(
     *,
     split_name: str,
     cache: dict[str, object],
+    lenses: list[object | None],
+    final_norm,
     maybe_apply_final_norm,
     lm_head_weight: torch.Tensor,
     answer_id_tensor_lm_head: torch.Tensor,
@@ -216,11 +232,23 @@ def build_feature_table(
     for layer_index in tqdm(layer_indices, desc=f"{split_name} feature extraction"):
         layer_hidden = hidden[:, layer_index, :]
         feature_blocks: dict[str, list[np.ndarray]] = {feature_name: [] for feature_name in FEATURE_NAMES}
+        layer_lens = lenses[layer_index]
+        if layer_lens is not None:
+            layer_lens = layer_lens.to(input_device)
+            layer_lens.eval()
+            for param in layer_lens.parameters():
+                param.requires_grad_(False)
 
         for start in range(0, layer_hidden.shape[0], READOUT_BATCH_SIZE):
             end = start + READOUT_BATCH_SIZE
             hidden_batch = layer_hidden[start:end].to(input_device)
-            readout = maybe_apply_final_norm(hidden_batch.float(), layer_index)
+            readout = compute_tuned_lens_readout(
+                hidden_batch.float(),
+                layer_index_0based=layer_index,
+                layer_lens=layer_lens,
+                final_norm=final_norm,
+                maybe_apply_final_norm=maybe_apply_final_norm,
+            )
             full_logits = torch.matmul(
                 readout.to(lm_head_weight.dtype),
                 lm_head_weight.T,
@@ -262,6 +290,8 @@ def build_feature_table(
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if layer_lens is not None:
+            layer_lens = layer_lens.cpu()
 
     return pd.DataFrame(rows)
 
@@ -396,12 +426,20 @@ def compute_feature_from_token_hidden(
     *,
     feature_name: str,
     layer_index_0based: int,
+    layer_lens,
+    final_norm,
     maybe_apply_final_norm,
     lm_head_weight: torch.Tensor,
     answer_id_tensor_lm_head: torch.Tensor,
     vocab_size: int,
 ) -> torch.Tensor:
-    readout = maybe_apply_final_norm(token_hidden, layer_index_0based)
+    readout = compute_tuned_lens_readout(
+        token_hidden,
+        layer_index_0based=layer_index_0based,
+        layer_lens=layer_lens,
+        final_norm=final_norm,
+        maybe_apply_final_norm=maybe_apply_final_norm,
+    )
     full_logits = torch.matmul(
         readout.to(lm_head_weight.dtype),
         lm_head_weight.T,
@@ -420,6 +458,8 @@ def compute_feature_steering_delta(
     *,
     feature_name: str,
     layer_index_0based: int,
+    layer_lens,
+    final_norm,
     maybe_apply_final_norm,
     lm_head_weight: torch.Tensor,
     answer_id_tensor_lm_head: torch.Tensor,
@@ -434,6 +474,8 @@ def compute_feature_steering_delta(
             base,
             feature_name=feature_name,
             layer_index_0based=layer_index_0based,
+            layer_lens=layer_lens,
+            final_norm=final_norm,
             maybe_apply_final_norm=maybe_apply_final_norm,
             lm_head_weight=lm_head_weight,
             answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -493,6 +535,8 @@ def summarize_delta_application(
     delta: torch.Tensor,
     feature_name: str,
     layer_index_0based: int,
+    layer_lens,
+    final_norm,
     maybe_apply_final_norm,
     lm_head_weight: torch.Tensor,
     answer_id_tensor_lm_head: torch.Tensor,
@@ -503,6 +547,8 @@ def summarize_delta_application(
         token_hidden + delta,
         feature_name=feature_name,
         layer_index_0based=layer_index_0based,
+        layer_lens=layer_lens,
+        final_norm=final_norm,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -610,6 +656,8 @@ def run_validation_policy(
     eval_cache: dict[str, object],
     eval_detector_outputs_df: pd.DataFrame,
     target_stats_df: pd.DataFrame,
+    lenses: list[object | None],
+    final_norm,
     tok: AutoTokenizer,
     model: AutoModelForCausalLM,
     input_device: torch.device,
@@ -641,6 +689,12 @@ def run_validation_policy(
         for feature_name in FEATURE_NAMES:
             for layer_number in active_layer_numbers:
                 steering_module = decoder_layers[layer_number - 1]
+                layer_lens = lenses[layer_number - 1]
+                if layer_lens is not None:
+                    layer_lens = layer_lens.to(input_device)
+                    layer_lens.eval()
+                    for param in layer_lens.parameters():
+                        param.requires_grad_(False)
                 target_row = target_lookup.loc[(feature_name, layer_number)]
                 target_lower = float(target_row["target_lower"])
                 target_upper = float(target_row["target_upper"])
@@ -723,6 +777,8 @@ def run_validation_policy(
                         token_hidden,
                         feature_name=feature_name,
                         layer_index_0based=layer_number - 1,
+                        layer_lens=layer_lens,
+                        final_norm=final_norm,
                         maybe_apply_final_norm=maybe_apply_final_norm,
                         lm_head_weight=lm_head_weight,
                         answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
@@ -744,6 +800,8 @@ def run_validation_policy(
                         delta=targeted_delta,
                         feature_name=feature_name,
                         layer_index_0based=layer_number - 1,
+                        layer_lens=layer_lens,
+                        final_norm=final_norm,
                         maybe_apply_final_norm=maybe_apply_final_norm,
                         lm_head_weight=lm_head_weight,
                         answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
@@ -755,6 +813,8 @@ def run_validation_policy(
                         delta=wrong_delta,
                         feature_name=feature_name,
                         layer_index_0based=layer_number - 1,
+                        layer_lens=layer_lens,
+                        final_norm=final_norm,
                         maybe_apply_final_norm=maybe_apply_final_norm,
                         lm_head_weight=lm_head_weight,
                         answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
@@ -766,6 +826,8 @@ def run_validation_policy(
                         delta=random_perp_delta,
                         feature_name=feature_name,
                         layer_index_0based=layer_number - 1,
+                        layer_lens=layer_lens,
+                        final_norm=final_norm,
                         maybe_apply_final_norm=maybe_apply_final_norm,
                         lm_head_weight=lm_head_weight,
                         answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
@@ -853,6 +915,8 @@ def run_validation_policy(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                if layer_lens is not None:
+                    layer_lens = layer_lens.cpu()
 
     return pd.DataFrame(targeted_rows), pd.DataFrame(control_rows)
 
@@ -864,8 +928,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fit-split", type=str, default="validation")
     parser.add_argument("--eval-split", type=str, default="train")
-    parser.add_argument("--fit-limit", type=int, default=None)
-    parser.add_argument("--eval-limit", type=int, default=None)
+    parser.add_argument("--fit-limit", type=int, default=1000)
+    parser.add_argument("--eval-limit", type=int, default=2500)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
     args = parser.parse_args(argv)
@@ -939,6 +1003,7 @@ def main(argv: list[str] | None = None) -> None:
     lm_head_weight = readout_ctx["lm_head_weight"]
     maybe_apply_final_norm = readout_ctx["maybe_apply_final_norm"]
     last_layer_needs_final_norm = readout_ctx["last_layer_needs_final_norm"]
+    hidden_size = int(model.lm_head.weight.shape[1])
 
     fit_cache = extract_split_cache(
         fit_rows,
@@ -971,9 +1036,20 @@ def main(argv: list[str] | None = None) -> None:
         last_layer_needs_final_norm=last_layer_needs_final_norm,
     )
 
+    lenses, lens_state_dicts, tuned_lens_history_df = train_tuned_lenses(
+        train_hidden=fit_cache["hidden"],
+        teacher_choice_probs_train=fit_cache["final_choice_probs"],
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        answer_choice_weight=answer_choice_weight,
+        train_device=input_device,
+    )
+
     fit_feature_df = build_feature_table(
         split_name=args.fit_split,
         cache=fit_cache,
+        lenses=lenses,
+        final_norm=final_norm,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -984,6 +1060,8 @@ def main(argv: list[str] | None = None) -> None:
     eval_feature_df = build_feature_table(
         split_name=args.eval_split,
         cache=eval_cache,
+        lenses=lenses,
+        final_norm=final_norm,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -1010,6 +1088,8 @@ def main(argv: list[str] | None = None) -> None:
         eval_cache=eval_cache,
         eval_detector_outputs_df=detector_outputs_df.loc[detector_outputs_df["split"].eq(args.eval_split)].copy(),
         target_stats_df=target_stats_df,
+        lenses=lenses,
+        final_norm=final_norm,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -1037,6 +1117,8 @@ def main(argv: list[str] | None = None) -> None:
     detector_coefficients_df.to_parquet(out_dir / "detector_coefficients.parquet", index=False)
     detector_outputs_df.to_parquet(out_dir / "detector_outputs.parquet", index=False)
     target_stats_df.to_parquet(out_dir / "feature_target_stats.parquet", index=False)
+    tuned_lens_history_df.to_parquet(out_dir / "tuned_lens_training_history.parquet", index=False)
+    torch.save(lens_state_dicts, out_dir / "tuned_lens_state.pt")
     validation_policy_outputs_raw_df.to_parquet(out_dir / f"{args.eval_split}_policy_outputs_raw.parquet", index=False)
     validation_policy_control_outputs_raw_df.to_parquet(
         out_dir / f"{args.eval_split}_policy_control_outputs_raw.parquet",
@@ -1052,7 +1134,8 @@ def main(argv: list[str] | None = None) -> None:
         "eval_split": args.eval_split,
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
-        "method": "univariate_logit_feature_steering",
+        "method": "univariate_tuned_lens_gap_steering_oneoff",
+        "readout_method": "tuned_lens",
         "detector_type": "l1_logistic_regression_cv",
         "detector_class_weight": "balanced",
         "feature_names": FEATURE_NAMES,
@@ -1065,6 +1148,9 @@ def main(argv: list[str] | None = None) -> None:
         "readout_batch_size": READOUT_BATCH_SIZE,
         "intervention_batch_size": INTERVENTION_BATCH_SIZE,
         "last_layer_needs_final_norm": bool(last_layer_needs_final_norm),
+        "tuned_lens_batch_size": 64,
+        "tuned_lens_max_epochs": 10,
+        "tuned_lens_patience": 2,
     }
     with open(out_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)

@@ -196,6 +196,7 @@ def compute_tuned_lens_readout(
     final_norm,
     maybe_apply_final_norm,
 ) -> torch.Tensor:
+    hidden_batch = hidden_batch.float()
     if layer_lens is None:
         return maybe_apply_final_norm(hidden_batch, layer_index_0based)
 

@@ -985,7 +985,7 @@ def main(argv: list[str] | None = None) -> None:
     input_device = get_input_device(model)
     decoder_layers = get_decoder_layers(model)
     num_layers = len(decoder_layers)
-    active_layer_numbers = latter_half_layer_numbers(num_layers)
+    active_layer_numbers = list(range(1, num_layers + 1))
     vocab_size = int(model.config.vocab_size)
 
     readout_ctx = prepare_readout_context(
@@ -1140,7 +1140,7 @@ def main(argv: list[str] | None = None) -> None:
         "detector_class_weight": "balanced",
         "feature_names": FEATURE_NAMES,
         "active_layer_numbers": active_layer_numbers,
-        "layer_selection_rule": "latter_half",
+        "layer_selection_rule": "all_layers",
         "control_intervention_types": CONTROL_INTERVENTION_TYPES,
         "target_lower_quantile": TARGET_LOWER_QUANTILE,
         "target_upper_quantile": TARGET_UPPER_QUANTILE,

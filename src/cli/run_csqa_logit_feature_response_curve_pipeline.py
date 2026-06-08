@@ -729,7 +729,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
-    parser.add_argument("--top-k-layers-per-feature", type=int, default=6)
+    parser.add_argument("--top-k-layers-per-feature", type=int, default=3)
     parser.add_argument("--step-fractions", type=str, default="0.25,0.5,1.0,1.5")
     parser.add_argument("--good-threshold-log-ratio", type=float, default=GOOD_REGION_LOG_RATIO_THRESHOLD)
     args = parser.parse_args(argv)

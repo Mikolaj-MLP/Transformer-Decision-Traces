@@ -24,7 +24,6 @@ if str(REPO_ROOT) not in sys.path:
 from src.cli.run_csqa_adaptive_contrastive_pipeline import (  # noqa: E402
     EXTRACT_BATCH_SIZE,
     READOUT_BATCH_SIZE,
-    answer_choice_ids_for_letters,
     choose_model_dtype_and_device_map,
     extract_split_cache,
     get_input_device,

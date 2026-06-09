@@ -16,6 +16,7 @@ DEFAULT_SIZES = ["1B", "3B"]
 DEFAULT_FIT_LIMIT = "1000"
 DEFAULT_EVAL_LIMIT = "2500"
 DEFAULT_TOP_K = "3"
+DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS = "0.005,0.01"
 
 
 def main() -> None:
@@ -47,6 +48,8 @@ def main() -> None:
                 DEFAULT_EVAL_LIMIT,
                 "--top-k-layers-per-feature",
                 DEFAULT_TOP_K,
+                "--max-delta-over-hidden-caps",
+                DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS,
                 *passthrough,
             ]
         )

@@ -52,6 +52,7 @@ FEATURE_NAMES = [
     "answer_choice_varentropy",
 ]
 DEFAULT_STEP_FRACTIONS = [0.25, 0.5, 1.0, 1.5]
+DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS = [0.005, 0.01]
 INTERVENTION_BATCH_SIZE = 2
 GRID_POINTS = 512
 GOOD_REGION_LOG_RATIO_THRESHOLD = math.log(1.5)
@@ -266,6 +267,15 @@ def smooth_1d(values: np.ndarray, sigma_grid: float) -> np.ndarray:
     pad = kernel.shape[0] // 2
     padded = np.pad(values, (pad, pad), mode="edge")
     return np.convolve(padded, kernel, mode="valid")
+
+
+def parse_float_list(raw: str) -> list[float]:
+    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("No float values provided")
+    if any(value <= 0 for value in values):
+        raise ValueError("All values must be positive")
+    return values
 
 
 def build_distribution_models(
@@ -513,6 +523,38 @@ def summarize_delta_application(
     }
 
 
+def apply_delta_over_hidden_cap(
+    token_hidden: torch.Tensor,
+    *,
+    delta_raw: torch.Tensor,
+    max_delta_over_hidden_cap: float,
+) -> dict[str, object]:
+    token_hidden_l2 = token_hidden.detach().float().norm(dim=-1)
+    raw_delta_l2 = delta_raw.detach().float().norm(dim=-1)
+    raw_delta_over_hidden = raw_delta_l2 / token_hidden_l2.clamp_min(1e-12)
+
+    cap_tensor = torch.full_like(raw_delta_over_hidden, float(max_delta_over_hidden_cap))
+    safe_ratio = cap_tensor / raw_delta_over_hidden.clamp_min(1e-12)
+    scale = torch.minimum(torch.ones_like(raw_delta_over_hidden), safe_ratio)
+    scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
+    delta_capped = delta_raw * scale.unsqueeze(-1).to(delta_raw.dtype)
+
+    capped_delta_l2 = delta_capped.detach().float().norm(dim=-1)
+    capped_delta_over_hidden = capped_delta_l2 / token_hidden_l2.clamp_min(1e-12)
+    was_capped = raw_delta_over_hidden > float(max_delta_over_hidden_cap) + 1e-12
+
+    return {
+        "delta_capped": delta_capped,
+        "token_hidden_l2_norm": token_hidden_l2.detach().cpu().numpy().astype(np.float32),
+        "raw_delta_l2_norm": raw_delta_l2.detach().cpu().numpy().astype(np.float32),
+        "raw_delta_over_token_hidden_l2": raw_delta_over_hidden.detach().cpu().numpy().astype(np.float32),
+        "capped_delta_l2_norm": capped_delta_l2.detach().cpu().numpy().astype(np.float32),
+        "capped_delta_over_token_hidden_l2": capped_delta_over_hidden.detach().cpu().numpy().astype(np.float32),
+        "cap_scale": scale.detach().cpu().numpy().astype(np.float32),
+        "was_capped": was_capped.detach().cpu().numpy().astype(bool),
+    }
+
+
 def run_single_intervention_forward(
     *,
     batch: dict[str, torch.Tensor],
@@ -567,6 +609,7 @@ def run_response_curve_policy(
     selected_layers_df: pd.DataFrame,
     region_models: dict[tuple[str, int], dict[str, object]],
     step_fractions: list[float],
+    max_delta_over_hidden_caps: list[float],
     tok: AutoTokenizer,
     model: AutoModelForCausalLM,
     input_device: torch.device,
@@ -590,7 +633,8 @@ def run_response_curve_policy(
         (str(row.feature_name), int(row.layer_number))
         for row in selected_layers_df.itertuples(index=False)
     ]
-    total_steps = len(selected_pairs) * len(step_fractions) * 2
+    num_eval_batches = math.ceil(len(eval_rows) / INTERVENTION_BATCH_SIZE)
+    total_steps = len(selected_pairs) * num_eval_batches * len(step_fractions) * 2 * len(max_delta_over_hidden_caps)
     rows: list[dict[str, object]] = []
 
     with tqdm(total=total_steps, desc=f"{eval_split_name} response-curve sweep") as pbar:
@@ -633,38 +677,44 @@ def run_response_curve_policy(
                 batch_eligible = np.asarray([eligible_all[idx] for idx in batch_indices], dtype=bool)
 
                 if not bool(batch_eligible.any()):
-                    for step_fraction in step_fractions:
-                        for direction in ["toward_good", "away_from_good"]:
-                            for batch_index, row in batch_df.iterrows():
-                                global_index = batch_indices[batch_index]
-                                rows.append(
-                                    {
-                                        "example_id": row["example_id"],
-                                        "feature_name": feature_name,
-                                        "layer_number": layer_number,
-                                        "step_fraction": float(step_fraction),
-                                        "direction": direction,
-                                        "eligible_for_intervention": False,
-                                        "current_region_label": str(batch_current_region[batch_index]),
-                                        "current_feature_value": float(current_feature_all[global_index]),
-                                        "target_good_value": float(batch_target_good[batch_index]) if math.isfinite(float(batch_target_good[batch_index])) else np.nan,
-                                        "full_distance_to_good": float(batch_full_distance[batch_index]) if math.isfinite(float(batch_full_distance[batch_index])) else np.nan,
-                                        "applied_feature_shift_fraction": float(step_fraction),
-                                        "steered_feature_value_local": np.nan,
-                                        "grad_l2_norm": 0.0,
-                                        "delta_l2_norm": 0.0,
-                                        "delta_over_token_hidden_l2": 0.0,
-                                        "token_hidden_l2_norm": np.nan,
-                                        "steered_best_non_choice_token_id": int(validation_best_non_choice_token_id[global_index]),
-                                        "steered_best_non_choice_logit": float(validation_best_non_choice_logit[global_index]),
-                                        "steered_logit_A": float(validation_choice_logits[global_index, 0]),
-                                        "steered_logit_B": float(validation_choice_logits[global_index, 1]),
-                                        "steered_logit_C": float(validation_choice_logits[global_index, 2]),
-                                        "steered_logit_D": float(validation_choice_logits[global_index, 3]),
-                                        "steered_logit_E": float(validation_choice_logits[global_index, 4]),
-                                    }
-                                )
-                            pbar.update(1)
+                    for max_delta_over_hidden_cap in max_delta_over_hidden_caps:
+                        for step_fraction in step_fractions:
+                            for direction in ["toward_good", "away_from_good"]:
+                                for batch_index, row in batch_df.iterrows():
+                                    global_index = batch_indices[batch_index]
+                                    rows.append(
+                                        {
+                                            "example_id": row["example_id"],
+                                            "feature_name": feature_name,
+                                            "layer_number": layer_number,
+                                            "step_fraction": float(step_fraction),
+                                            "direction": direction,
+                                            "max_delta_over_hidden_cap": float(max_delta_over_hidden_cap),
+                                            "eligible_for_intervention": False,
+                                            "current_region_label": str(batch_current_region[batch_index]),
+                                            "current_feature_value": float(current_feature_all[global_index]),
+                                            "target_good_value": float(batch_target_good[batch_index]) if math.isfinite(float(batch_target_good[batch_index])) else np.nan,
+                                            "full_distance_to_good": float(batch_full_distance[batch_index]) if math.isfinite(float(batch_full_distance[batch_index])) else np.nan,
+                                            "applied_feature_shift_fraction": float(step_fraction),
+                                            "steered_feature_value_local": np.nan,
+                                            "grad_l2_norm": 0.0,
+                                            "raw_delta_l2_norm": 0.0,
+                                            "raw_delta_over_token_hidden_l2": 0.0,
+                                            "cap_scale": 1.0,
+                                            "was_capped": False,
+                                            "delta_l2_norm": 0.0,
+                                            "delta_over_token_hidden_l2": 0.0,
+                                            "token_hidden_l2_norm": np.nan,
+                                            "steered_best_non_choice_token_id": int(validation_best_non_choice_token_id[global_index]),
+                                            "steered_best_non_choice_logit": float(validation_best_non_choice_logit[global_index]),
+                                            "steered_logit_A": float(validation_choice_logits[global_index, 0]),
+                                            "steered_logit_B": float(validation_choice_logits[global_index, 1]),
+                                            "steered_logit_C": float(validation_choice_logits[global_index, 2]),
+                                            "steered_logit_D": float(validation_choice_logits[global_index, 3]),
+                                            "steered_logit_E": float(validation_choice_logits[global_index, 4]),
+                                        }
+                                    )
+                                pbar.update(1)
                     continue
 
                 batch_cpu = encode_prompts(batch_df["text"].tolist(), tok, max_seq_len)
@@ -691,61 +741,73 @@ def run_response_curve_policy(
                 )
                 basis_delta = delta_basis["basis_delta"]
 
-                for direction, direction_sign in [("toward_good", 1.0), ("away_from_good", -1.0)]:
-                    for step_fraction in step_fractions:
-                        delta = (direction_sign * float(step_fraction)) * basis_delta
-                        delta_stats = summarize_delta_application(
-                            token_hidden,
-                            delta=delta,
-                            feature_name=feature_name,
-                            layer_index_0based=layer_number - 1,
-                            maybe_apply_final_norm=maybe_apply_final_norm,
-                            lm_head_weight=lm_head_weight,
-                            answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
-                            vocab_size=vocab_size,
-                            grad_l2_norm=delta_basis["grad_l2_norm"],
-                        )
-                        outputs = run_single_intervention_forward(
-                            batch=batch,
-                            decision_pos=decision_pos,
-                            model=model,
-                            steering_module=steering_module,
-                            delta=delta,
-                            true_choice_idx=true_choice_idx,
-                            answer_id_tensor_cpu=answer_id_tensor_cpu,
-                        )
-
-                        for batch_index, row in batch_df.iterrows():
-                            global_index = batch_indices[batch_index]
-                            rows.append(
-                                {
-                                    "example_id": row["example_id"],
-                                    "feature_name": feature_name,
-                                    "layer_number": layer_number,
-                                    "step_fraction": float(step_fraction),
-                                    "direction": direction,
-                                    "eligible_for_intervention": bool(batch_eligible[batch_index]),
-                                    "current_region_label": str(batch_current_region[batch_index]),
-                                    "current_feature_value": float(delta_basis["current_feature_value"][batch_index]),
-                                    "target_good_value": float(batch_target_good[batch_index]) if math.isfinite(float(batch_target_good[batch_index])) else np.nan,
-                                    "full_distance_to_good": float(delta_basis["full_distance_to_good"][batch_index]),
-                                    "applied_feature_shift_fraction": float(direction_sign * step_fraction),
-                                    "steered_feature_value_local": float(delta_stats["steered_feature_value_local"][batch_index]),
-                                    "grad_l2_norm": float(delta_stats["grad_l2_norm"][batch_index]),
-                                    "delta_l2_norm": float(delta_stats["delta_l2_norm"][batch_index]),
-                                    "delta_over_token_hidden_l2": float(delta_stats["delta_over_token_hidden_l2"][batch_index]),
-                                    "token_hidden_l2_norm": float(delta_stats["token_hidden_l2_norm"][batch_index]),
-                                    "steered_best_non_choice_token_id": int(outputs["best_non_choice_token_id"][batch_index]),
-                                    "steered_best_non_choice_logit": float(outputs["best_non_choice_logit"][batch_index]),
-                                    "steered_logit_A": float(outputs["choice_logits"][batch_index, 0]),
-                                    "steered_logit_B": float(outputs["choice_logits"][batch_index, 1]),
-                                    "steered_logit_C": float(outputs["choice_logits"][batch_index, 2]),
-                                    "steered_logit_D": float(outputs["choice_logits"][batch_index, 3]),
-                                    "steered_logit_E": float(outputs["choice_logits"][batch_index, 4]),
-                                }
+                for max_delta_over_hidden_cap in max_delta_over_hidden_caps:
+                    for direction, direction_sign in [("toward_good", 1.0), ("away_from_good", -1.0)]:
+                        for step_fraction in step_fractions:
+                            delta_raw = (direction_sign * float(step_fraction)) * basis_delta
+                            delta_cap = apply_delta_over_hidden_cap(
+                                token_hidden,
+                                delta_raw=delta_raw,
+                                max_delta_over_hidden_cap=float(max_delta_over_hidden_cap),
+                            )
+                            delta = delta_cap["delta_capped"]
+                            delta_stats = summarize_delta_application(
+                                token_hidden,
+                                delta=delta,
+                                feature_name=feature_name,
+                                layer_index_0based=layer_number - 1,
+                                maybe_apply_final_norm=maybe_apply_final_norm,
+                                lm_head_weight=lm_head_weight,
+                                answer_id_tensor_lm_head=answer_id_tensor_lm_head.to(input_device),
+                                vocab_size=vocab_size,
+                                grad_l2_norm=delta_basis["grad_l2_norm"],
+                            )
+                            outputs = run_single_intervention_forward(
+                                batch=batch,
+                                decision_pos=decision_pos,
+                                model=model,
+                                steering_module=steering_module,
+                                delta=delta,
+                                true_choice_idx=true_choice_idx,
+                                answer_id_tensor_cpu=answer_id_tensor_cpu,
                             )
 
-                        pbar.update(1)
+                            for batch_index, row in batch_df.iterrows():
+                                global_index = batch_indices[batch_index]
+                                rows.append(
+                                    {
+                                        "example_id": row["example_id"],
+                                        "feature_name": feature_name,
+                                        "layer_number": layer_number,
+                                        "step_fraction": float(step_fraction),
+                                        "direction": direction,
+                                        "max_delta_over_hidden_cap": float(max_delta_over_hidden_cap),
+                                        "eligible_for_intervention": bool(batch_eligible[batch_index]),
+                                        "current_region_label": str(batch_current_region[batch_index]),
+                                        "current_feature_value": float(delta_basis["current_feature_value"][batch_index]),
+                                        "target_good_value": float(batch_target_good[batch_index]) if math.isfinite(float(batch_target_good[batch_index])) else np.nan,
+                                        "full_distance_to_good": float(delta_basis["full_distance_to_good"][batch_index]),
+                                        "applied_feature_shift_fraction": float(direction_sign * step_fraction),
+                                        "steered_feature_value_local": float(delta_stats["steered_feature_value_local"][batch_index]),
+                                        "grad_l2_norm": float(delta_stats["grad_l2_norm"][batch_index]),
+                                        "raw_delta_l2_norm": float(delta_cap["raw_delta_l2_norm"][batch_index]),
+                                        "raw_delta_over_token_hidden_l2": float(delta_cap["raw_delta_over_token_hidden_l2"][batch_index]),
+                                        "cap_scale": float(delta_cap["cap_scale"][batch_index]),
+                                        "was_capped": bool(delta_cap["was_capped"][batch_index]),
+                                        "delta_l2_norm": float(delta_stats["delta_l2_norm"][batch_index]),
+                                        "delta_over_token_hidden_l2": float(delta_stats["delta_over_token_hidden_l2"][batch_index]),
+                                        "token_hidden_l2_norm": float(delta_stats["token_hidden_l2_norm"][batch_index]),
+                                        "steered_best_non_choice_token_id": int(outputs["best_non_choice_token_id"][batch_index]),
+                                        "steered_best_non_choice_logit": float(outputs["best_non_choice_logit"][batch_index]),
+                                        "steered_logit_A": float(outputs["choice_logits"][batch_index, 0]),
+                                        "steered_logit_B": float(outputs["choice_logits"][batch_index, 1]),
+                                        "steered_logit_C": float(outputs["choice_logits"][batch_index, 2]),
+                                        "steered_logit_D": float(outputs["choice_logits"][batch_index, 3]),
+                                        "steered_logit_E": float(outputs["choice_logits"][batch_index, 4]),
+                                    }
+                                )
+
+                            pbar.update(1)
 
                 gc.collect()
                 if torch.cuda.is_available():
@@ -755,12 +817,7 @@ def run_response_curve_policy(
 
 
 def parse_step_fractions(raw: str) -> list[float]:
-    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
-    if not values:
-        raise ValueError("No step fractions provided")
-    if any(value <= 0 for value in values):
-        raise ValueError("Step fractions must be positive")
-    return values
+    return parse_float_list(raw)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -777,6 +834,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--validation-limit", type=int, default=None)
     parser.add_argument("--top-k-layers-per-feature", type=int, default=3)
     parser.add_argument("--step-fractions", type=str, default="0.25,0.5,1.0,1.5")
+    parser.add_argument(
+        "--max-delta-over-hidden-caps",
+        type=str,
+        default=",".join(str(x) for x in DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS),
+    )
     parser.add_argument("--good-threshold-log-ratio", type=float, default=GOOD_REGION_LOG_RATIO_THRESHOLD)
     args = parser.parse_args(argv)
 
@@ -788,6 +850,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.fit_split == args.eval_split:
         raise ValueError("--fit-split and --eval-split must be different")
     step_fractions = parse_step_fractions(args.step_fractions)
+    max_delta_over_hidden_caps = parse_float_list(args.max_delta_over_hidden_caps)
 
     print(
         "[config]",
@@ -804,6 +867,7 @@ def main(argv: list[str] | None = None) -> None:
                 "feature_names": FEATURE_NAMES,
                 "top_k_layers_per_feature": int(args.top_k_layers_per_feature),
                 "step_fractions": step_fractions,
+                "max_delta_over_hidden_caps": max_delta_over_hidden_caps,
                 "good_threshold_log_ratio": float(args.good_threshold_log_ratio),
                 "support_lower_quantile": float(SUPPORT_LOWER_QUANTILE),
                 "support_upper_quantile": float(SUPPORT_UPPER_QUANTILE),
@@ -932,6 +996,7 @@ def main(argv: list[str] | None = None) -> None:
         selected_layers_df=selected_layers_df,
         region_models=region_models,
         step_fractions=step_fractions,
+        max_delta_over_hidden_caps=max_delta_over_hidden_caps,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -978,6 +1043,7 @@ def main(argv: list[str] | None = None) -> None:
             for feature_name in FEATURE_NAMES
         },
         "step_fractions": step_fractions,
+        "max_delta_over_hidden_caps": max_delta_over_hidden_caps,
         "good_region_log_ratio_threshold": float(args.good_threshold_log_ratio),
         "support_lower_quantile": float(SUPPORT_LOWER_QUANTILE),
         "support_upper_quantile": float(SUPPORT_UPPER_QUANTILE),

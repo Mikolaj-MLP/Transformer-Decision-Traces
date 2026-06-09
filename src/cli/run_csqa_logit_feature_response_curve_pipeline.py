@@ -57,6 +57,10 @@ GRID_POINTS = 512
 GOOD_REGION_LOG_RATIO_THRESHOLD = math.log(1.5)
 GRAD_NORM_EPS = 1e-12
 KDE_JITTER_SCALE = 1e-6
+SUPPORT_LOWER_QUANTILE = 0.01
+SUPPORT_UPPER_QUANTILE = 0.99
+KDE_BANDWIDTH_MULTIPLIER = 1.5
+LOG_RATIO_SMOOTHING_SIGMA_BANDWIDTHS = 1.0
 
 
 def now_id() -> str:
@@ -245,6 +249,25 @@ def fit_kde(values: np.ndarray, bandwidth: float) -> KernelDensity:
     return model
 
 
+def gaussian_kernel_1d(sigma_grid: float) -> np.ndarray:
+    if sigma_grid <= 1e-8:
+        return np.array([1.0], dtype=np.float64)
+    radius = max(1, int(math.ceil(3.0 * sigma_grid)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma_grid) ** 2)
+    kernel /= np.sum(kernel)
+    return kernel
+
+
+def smooth_1d(values: np.ndarray, sigma_grid: float) -> np.ndarray:
+    kernel = gaussian_kernel_1d(float(sigma_grid))
+    if kernel.shape[0] == 1:
+        return values.copy()
+    pad = kernel.shape[0] // 2
+    padded = np.pad(values, (pad, pad), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def build_distribution_models(
     *,
     fit_feature_df: pd.DataFrame,
@@ -269,7 +292,7 @@ def build_distribution_models(
             correct_values = pooled[: correct_values.shape[0]]
             incorrect_values = pooled[correct_values.shape[0] :]
 
-        bandwidth = silverman_bandwidth(pooled)
+        bandwidth = KDE_BANDWIDTH_MULTIPLIER * silverman_bandwidth(pooled)
         kde_good = fit_kde(correct_values, bandwidth)
         kde_bad = fit_kde(incorrect_values, bandwidth)
 
@@ -281,23 +304,41 @@ def build_distribution_models(
 
         log_p_good = kde_good.score_samples(grid.reshape(-1, 1))
         log_p_bad = kde_bad.score_samples(grid.reshape(-1, 1))
-        log_ratio = log_p_good - log_p_bad
+        log_ratio_raw = log_p_good - log_p_bad
+        grid_step = float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0
+        sigma_x = max(bandwidth * LOG_RATIO_SMOOTHING_SIGMA_BANDWIDTHS, grid_step)
+        sigma_grid = sigma_x / max(grid_step, 1e-12)
+        log_ratio = smooth_1d(log_ratio_raw, sigma_grid)
 
-        good_mask = log_ratio >= log_ratio_threshold
-        bad_mask = log_ratio <= -log_ratio_threshold
+        support_low = float(np.quantile(pooled, SUPPORT_LOWER_QUANTILE))
+        support_high = float(np.quantile(pooled, SUPPORT_UPPER_QUANTILE))
+        supported_mask = (grid >= support_low) & (grid <= support_high)
+
+        good_mask = supported_mask & (log_ratio >= log_ratio_threshold)
+        bad_mask = supported_mask & (log_ratio <= -log_ratio_threshold)
         if not bool(good_mask.any()):
-            max_idx = int(np.argmax(log_ratio))
+            supported_indices = np.where(supported_mask)[0]
+            candidate_indices = supported_indices if supported_indices.size > 0 else np.arange(grid.shape[0])
+            max_idx = int(candidate_indices[np.argmax(log_ratio[candidate_indices])])
             good_mask[max_idx] = True
-        region_label = np.where(good_mask, "good", np.where(bad_mask, "bad", "neutral"))
+        region_label = np.full(grid.shape[0], "unsupported", dtype=object)
+        region_label[supported_mask] = "neutral"
+        region_label[bad_mask] = "bad"
+        region_label[good_mask] = "good"
 
         models[(feature_name, int(layer_number))] = {
             "grid": grid,
             "log_p_good": log_p_good,
             "log_p_bad": log_p_bad,
             "log_ratio": log_ratio,
+            "log_ratio_raw": log_ratio_raw,
             "region_label": region_label,
             "good_mask": good_mask,
+            "supported_mask": supported_mask,
             "bandwidth": bandwidth,
+            "support_low": support_low,
+            "support_high": support_high,
+            "smoothing_sigma_grid": float(sigma_grid),
         }
 
         for idx in range(grid.shape[0]):
@@ -310,9 +351,14 @@ def build_distribution_models(
                     "log_p_bad": float(log_p_bad[idx]),
                     "p_good": float(math.exp(log_p_good[idx])),
                     "p_bad": float(math.exp(log_p_bad[idx])),
+                    "log_density_ratio_raw": float(log_ratio_raw[idx]),
                     "log_density_ratio": float(log_ratio[idx]),
                     "region_label": str(region_label[idx]),
+                    "is_supported": bool(supported_mask[idx]),
                     "bandwidth": float(bandwidth),
+                    "support_low": support_low,
+                    "support_high": support_high,
+                    "smoothing_sigma_grid": float(sigma_grid),
                 }
             )
 
@@ -575,7 +621,7 @@ def run_response_curve_policy(
                 eligible_all.append(
                     bool(target_good is not None)
                     and abs(float(full_distance)) > 1e-8
-                    and current_region != "good"
+                    and current_region not in {"good", "unsupported"}
                 )
 
             for start in range(0, len(eval_rows), INTERVENTION_BATCH_SIZE):
@@ -759,6 +805,10 @@ def main(argv: list[str] | None = None) -> None:
                 "top_k_layers_per_feature": int(args.top_k_layers_per_feature),
                 "step_fractions": step_fractions,
                 "good_threshold_log_ratio": float(args.good_threshold_log_ratio),
+                "support_lower_quantile": float(SUPPORT_LOWER_QUANTILE),
+                "support_upper_quantile": float(SUPPORT_UPPER_QUANTILE),
+                "kde_bandwidth_multiplier": float(KDE_BANDWIDTH_MULTIPLIER),
+                "log_ratio_smoothing_sigma_bandwidths": float(LOG_RATIO_SMOOTHING_SIGMA_BANDWIDTHS),
             },
             indent=2,
         ),
@@ -929,6 +979,10 @@ def main(argv: list[str] | None = None) -> None:
         },
         "step_fractions": step_fractions,
         "good_region_log_ratio_threshold": float(args.good_threshold_log_ratio),
+        "support_lower_quantile": float(SUPPORT_LOWER_QUANTILE),
+        "support_upper_quantile": float(SUPPORT_UPPER_QUANTILE),
+        "kde_bandwidth_multiplier": float(KDE_BANDWIDTH_MULTIPLIER),
+        "log_ratio_smoothing_sigma_bandwidths": float(LOG_RATIO_SMOOTHING_SIGMA_BANDWIDTHS),
         "distribution_grid_points": int(GRID_POINTS),
         "extract_batch_size": EXTRACT_BATCH_SIZE,
         "readout_batch_size": READOUT_BATCH_SIZE,

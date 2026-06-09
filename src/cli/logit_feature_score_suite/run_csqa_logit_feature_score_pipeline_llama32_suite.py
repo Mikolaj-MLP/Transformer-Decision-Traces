@@ -14,7 +14,7 @@ from src.csqa.model_presets import resolve_llama32_instruct_model_id
 
 DEFAULT_SIZES = ["1B", "3B"]
 DEFAULT_FIT_LIMIT = "1000"
-DEFAULT_EVAL_LIMIT = "2500"
+DEFAULT_EVAL_LIMIT = "1500"
 DEFAULT_TOP_K = "3"
 DEFAULT_MAX_DELTA_OVER_HIDDEN = "0.005"
 
@@ -57,4 +57,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -46,7 +46,7 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
-FEATURE_NAMES = [
+DEFAULT_FEATURE_NAMES = [
     "answer_choice_entropy_normalized",
     "answer_choice_top1_top2_logit_gap",
     "answer_choice_varentropy",
@@ -84,6 +84,16 @@ def parse_positive_scale_list(raw: str) -> list[float]:
     values = parse_float_list(raw)
     if any(value > 1.0 + 1e-12 for value in values):
         raise ValueError("Backtrack scales must be in (0, 1]")
+    return values
+
+
+def parse_feature_names(raw: str) -> list[str]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("No feature names provided")
+    unknown = [value for value in values if value not in DEFAULT_FEATURE_NAMES]
+    if unknown:
+        raise ValueError(f"Unknown feature names: {unknown}. Allowed: {DEFAULT_FEATURE_NAMES}")
     return values
 
 
@@ -539,6 +549,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
     parser.add_argument("--top-k-layers-per-feature", type=int, default=3)
+    parser.add_argument(
+        "--feature-names",
+        type=str,
+        default=",".join(DEFAULT_FEATURE_NAMES),
+    )
     parser.add_argument("--max-delta-over-hidden", type=float, default=DEFAULT_MAX_DELTA_OVER_HIDDEN)
     parser.add_argument(
         "--backtrack-scales",
@@ -558,6 +573,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.max_delta_over_hidden <= 0:
         raise ValueError("--max-delta-over-hidden must be positive")
     backtrack_scales = parse_positive_scale_list(args.backtrack_scales)
+    feature_names = parse_feature_names(args.feature_names)
 
     print(
         "[config]",
@@ -571,7 +587,7 @@ def main(argv: list[str] | None = None) -> None:
                 "eval_limit": eval_limit,
                 "max_seq_len": args.max_seq_len,
                 "seed": args.seed,
-                "feature_names": FEATURE_NAMES,
+                "feature_names": feature_names,
                 "top_k_layers_per_feature": int(args.top_k_layers_per_feature),
                 "max_delta_over_hidden": float(args.max_delta_over_hidden),
                 "backtrack_scales": backtrack_scales,
@@ -663,7 +679,7 @@ def main(argv: list[str] | None = None) -> None:
     fit_feature_df = build_feature_table(
         split_name=args.fit_split,
         cache=fit_cache,
-        feature_names=FEATURE_NAMES,
+        feature_names=feature_names,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -674,7 +690,7 @@ def main(argv: list[str] | None = None) -> None:
     eval_feature_df = build_feature_table(
         split_name=args.eval_split,
         cache=eval_cache,
-        feature_names=FEATURE_NAMES,
+        feature_names=feature_names,
         maybe_apply_final_norm=maybe_apply_final_norm,
         lm_head_weight=lm_head_weight,
         answer_id_tensor_lm_head=answer_id_tensor_lm_head,
@@ -686,7 +702,7 @@ def main(argv: list[str] | None = None) -> None:
     separation_df = build_separation_summary(fit_feature_df)
     selected_layers_df = select_top_k_layers_by_feature(
         separation_df,
-        feature_names=FEATURE_NAMES,
+        feature_names=feature_names,
         top_k=int(args.top_k_layers_per_feature),
     )
     region_models, distribution_grid_df = build_distribution_models(
@@ -746,7 +762,7 @@ def main(argv: list[str] | None = None) -> None:
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
         "method": "logit_feature_score_ascent",
-        "feature_names": FEATURE_NAMES,
+        "feature_names": feature_names,
         "candidate_layer_numbers": candidate_layer_numbers,
         "layer_selection_rule": "top_k_by_ks_statistic",
         "top_k_layers_per_feature": int(args.top_k_layers_per_feature),

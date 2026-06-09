@@ -14,9 +14,10 @@ from src.csqa.model_presets import resolve_qwen25_instruct_model_id
 
 DEFAULT_SIZES = ["0.5B", "3B", "7B"]
 DEFAULT_FIT_LIMIT = "1000"
-DEFAULT_EVAL_LIMIT = "1500"
-DEFAULT_TOP_K = "3"
+DEFAULT_EVAL_LIMIT = "450"
+DEFAULT_TOP_K = "7"
 DEFAULT_MAX_DELTA_OVER_HIDDEN = "0.005"
+DEFAULT_FEATURE_NAMES = "answer_choice_top1_top2_logit_gap,answer_choice_varentropy"
 
 
 def main() -> None:
@@ -48,6 +49,8 @@ def main() -> None:
                 DEFAULT_EVAL_LIMIT,
                 "--top-k-layers-per-feature",
                 DEFAULT_TOP_K,
+                "--feature-names",
+                DEFAULT_FEATURE_NAMES,
                 "--max-delta-over-hidden",
                 DEFAULT_MAX_DELTA_OVER_HIDDEN,
                 *passthrough,

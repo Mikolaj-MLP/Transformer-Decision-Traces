@@ -49,7 +49,6 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 
 
 LETTERS = ["A", "B", "C", "D", "E"]
-DEFAULT_TRAIN_LIMIT = 2000
 
 
 def now_id() -> str:
@@ -71,7 +70,7 @@ def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
 
 
 def default_limit_for_split(split_name: str) -> int | None:
-    return DEFAULT_TRAIN_LIMIT if split_name == "train" else None
+    return None
 
 
 def build_layerwise_choice_readout_table(

@@ -14,7 +14,7 @@ from src.csqa.model_presets import resolve_llama32_instruct_model_id, resolve_qw
 
 DEFAULT_QWEN_SIZES = ["0.5B", "3B", "7B"]
 DEFAULT_LLAMA_SIZES = ["1B", "3B"]
-DEFAULT_FIT_LIMIT = "2000"
+DEFAULT_FIT_LIMIT = None
 DEFAULT_EVAL_LIMIT = None
 DEFAULT_FEATURE_NAMES = (
     "answer_choice_entropy_normalized,"
@@ -77,12 +77,12 @@ def main() -> None:
         cmd = [
             "--model-id",
             model_id,
-            "--fit-limit",
-            DEFAULT_FIT_LIMIT,
             "--feature-names",
             DEFAULT_FEATURE_NAMES,
             *passthrough,
         ]
+        if DEFAULT_FIT_LIMIT is not None:
+            cmd.extend(["--fit-limit", DEFAULT_FIT_LIMIT])
         if DEFAULT_EVAL_LIMIT is not None:
             cmd.extend(["--eval-limit", DEFAULT_EVAL_LIMIT])
         base_main(cmd)

@@ -15,8 +15,8 @@ from src.csqa.model_presets import resolve_llama32_instruct_model_id, resolve_qw
 DEFAULT_QWEN_SIZES = ["3B"]
 DEFAULT_LLAMA_SIZES = ["3B"]
 DEFAULT_CAPS = ["0.0025", "0.005", "0.01"]
-DEFAULT_FIT_LIMIT = "1000"
-DEFAULT_EVAL_LIMIT = "650"
+DEFAULT_FIT_LIMIT = "2000"
+DEFAULT_EVAL_LIMIT = None
 DEFAULT_TOP_K = "6"
 DEFAULT_FEATURE_NAMES = "answer_choice_top1_top2_logit_gap,answer_choice_varentropy"
 
@@ -92,23 +92,22 @@ def main() -> None:
 
     for label, model_id, cap in planned_runs:
         print(f"[cap-sweep] starting {label} | cap={cap} -> {model_id}")
-        base_main(
-            [
-                "--model-id",
-                model_id,
-                "--fit-limit",
-                DEFAULT_FIT_LIMIT,
-                "--eval-limit",
-                DEFAULT_EVAL_LIMIT,
-                "--top-k-layers-per-feature",
-                DEFAULT_TOP_K,
-                "--feature-names",
-                DEFAULT_FEATURE_NAMES,
-                "--max-delta-over-hidden",
-                cap,
-                *passthrough,
-            ]
-        )
+        cmd = [
+            "--model-id",
+            model_id,
+            "--fit-limit",
+            DEFAULT_FIT_LIMIT,
+            "--top-k-layers-per-feature",
+            DEFAULT_TOP_K,
+            "--feature-names",
+            DEFAULT_FEATURE_NAMES,
+            "--max-delta-over-hidden",
+            cap,
+            *passthrough,
+        ]
+        if DEFAULT_EVAL_LIMIT is not None:
+            cmd.extend(["--eval-limit", DEFAULT_EVAL_LIMIT])
+        base_main(cmd)
 
 
 if __name__ == "__main__":

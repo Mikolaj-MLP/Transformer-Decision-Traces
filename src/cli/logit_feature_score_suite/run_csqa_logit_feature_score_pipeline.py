@@ -56,6 +56,7 @@ DEFAULT_MAX_DELTA_OVER_HIDDEN = 0.005
 DEFAULT_BACKTRACK_SCALES = [1.0, 0.5, 0.25, 0.125]
 GRAD_NORM_EPS = 1e-12
 SCORE_IMPROVEMENT_EPS = 1e-6
+DEFAULT_TRAIN_LIMIT = 2000
 
 
 def now_id() -> str:
@@ -78,6 +79,10 @@ def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
 
 def all_layer_numbers(num_layers: int) -> list[int]:
     return list(range(1, num_layers + 1))
+
+
+def default_limit_for_split(split_name: str) -> int | None:
+    return DEFAULT_TRAIN_LIMIT if split_name == "train" else None
 
 
 def parse_positive_scale_list(raw: str) -> list[float]:
@@ -542,8 +547,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fit-split", type=str, default="validation")
-    parser.add_argument("--eval-split", type=str, default="train")
+    parser.add_argument("--fit-split", type=str, default="train")
+    parser.add_argument("--eval-split", type=str, default="validation")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
@@ -566,8 +571,32 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    fit_limit = args.fit_limit if args.fit_limit is not None else args.train_limit
-    eval_limit = args.eval_limit if args.eval_limit is not None else args.validation_limit
+    fit_limit = (
+        args.fit_limit
+        if args.fit_limit is not None
+        else (
+            args.train_limit
+            if args.fit_split == "train" and args.train_limit is not None
+            else (
+                args.validation_limit
+                if args.fit_split == "validation" and args.validation_limit is not None
+                else default_limit_for_split(args.fit_split)
+            )
+        )
+    )
+    eval_limit = (
+        args.eval_limit
+        if args.eval_limit is not None
+        else (
+            args.train_limit
+            if args.eval_split == "train" and args.train_limit is not None
+            else (
+                args.validation_limit
+                if args.eval_split == "validation" and args.validation_limit is not None
+                else default_limit_for_split(args.eval_split)
+            )
+        )
+    )
     if args.fit_split == args.eval_split:
         raise ValueError("--fit-split and --eval-split must be different")
     if args.max_delta_over_hidden <= 0:

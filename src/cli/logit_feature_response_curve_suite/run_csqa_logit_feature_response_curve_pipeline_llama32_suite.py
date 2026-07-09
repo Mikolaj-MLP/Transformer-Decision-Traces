@@ -13,8 +13,8 @@ from src.csqa.model_presets import resolve_llama32_instruct_model_id
 
 
 DEFAULT_SIZES = ["1B", "3B"]
-DEFAULT_FIT_LIMIT = "1000"
-DEFAULT_EVAL_LIMIT = "2500"
+DEFAULT_FIT_LIMIT = "2000"
+DEFAULT_EVAL_LIMIT = None
 DEFAULT_TOP_K = "3"
 DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS = "0.005,0.01"
 
@@ -38,21 +38,20 @@ def main() -> None:
     for size in sizes:
         model_id = resolve_llama32_instruct_model_id(size)
         print(f"[suite] starting {size} -> {model_id}")
-        base_main(
-            [
-                "--model-id",
-                model_id,
-                "--fit-limit",
-                DEFAULT_FIT_LIMIT,
-                "--eval-limit",
-                DEFAULT_EVAL_LIMIT,
-                "--top-k-layers-per-feature",
-                DEFAULT_TOP_K,
-                "--max-delta-over-hidden-caps",
-                DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS,
-                *passthrough,
-            ]
-        )
+        cmd = [
+            "--model-id",
+            model_id,
+            "--fit-limit",
+            DEFAULT_FIT_LIMIT,
+            "--top-k-layers-per-feature",
+            DEFAULT_TOP_K,
+            "--max-delta-over-hidden-caps",
+            DEFAULT_MAX_DELTA_OVER_HIDDEN_CAPS,
+            *passthrough,
+        ]
+        if DEFAULT_EVAL_LIMIT is not None:
+            cmd.extend(["--eval-limit", DEFAULT_EVAL_LIMIT])
+        base_main(cmd)
 
 
 if __name__ == "__main__":

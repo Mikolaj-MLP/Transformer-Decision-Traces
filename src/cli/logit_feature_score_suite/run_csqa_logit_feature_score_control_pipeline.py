@@ -63,6 +63,7 @@ from src.data.load_csqa import load_csqa  # noqa: E402
 INTERVENTION_BATCH_SIZE = 2
 CONTROL_INTERVENTION_TYPES = ("ascent", "descent", "random_same_norm")
 RANDOM_ORTHO_EPS = 1e-8
+DEFAULT_TRAIN_LIMIT = 2000
 
 
 def resolve_out_dir(out_dir: str | None, model_id: str) -> Path:
@@ -97,6 +98,10 @@ def build_random_same_norm_delta(
     random_delta = random_unit * ref_norm.to(random_unit.dtype)
     mask = torch.as_tensor(intervention_mask, device=random_delta.device, dtype=random_delta.dtype).unsqueeze(-1)
     return (random_delta * mask).detach()
+
+
+def default_limit_for_split(split_name: str) -> int | None:
+    return DEFAULT_TRAIN_LIMIT if split_name == "train" else None
 
 
 def compute_delta_norm_stats(
@@ -363,8 +368,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--fit-split", type=str, default="validation")
-    parser.add_argument("--eval-split", type=str, default="train")
+    parser.add_argument("--fit-split", type=str, default="train")
+    parser.add_argument("--eval-split", type=str, default="validation")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
@@ -387,8 +392,32 @@ def main(argv: list[str] | None = None) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    fit_limit = args.fit_limit if args.fit_limit is not None else args.train_limit
-    eval_limit = args.eval_limit if args.eval_limit is not None else args.validation_limit
+    fit_limit = (
+        args.fit_limit
+        if args.fit_limit is not None
+        else (
+            args.train_limit
+            if args.fit_split == "train" and args.train_limit is not None
+            else (
+                args.validation_limit
+                if args.fit_split == "validation" and args.validation_limit is not None
+                else default_limit_for_split(args.fit_split)
+            )
+        )
+    )
+    eval_limit = (
+        args.eval_limit
+        if args.eval_limit is not None
+        else (
+            args.train_limit
+            if args.eval_split == "train" and args.train_limit is not None
+            else (
+                args.validation_limit
+                if args.eval_split == "validation" and args.validation_limit is not None
+                else default_limit_for_split(args.eval_split)
+            )
+        )
+    )
     if args.fit_split == args.eval_split:
         raise ValueError("--fit-split and --eval-split must be different")
     if args.max_delta_over_hidden <= 0:

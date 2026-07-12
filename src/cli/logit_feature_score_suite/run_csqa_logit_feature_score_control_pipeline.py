@@ -37,14 +37,8 @@ from src.cli.logit_feature_score_suite.run_csqa_logit_feature_score_pipeline imp
     split_artifact_tag,
     slugify_model_id,
 )
-from src.cli.run_csqa_adaptive_contrastive_pipeline import (  # noqa: E402
+from src.cli.logit_feature_score_suite.common import (  # noqa: E402
     EXTRACT_BATCH_SIZE,
-    choose_model_dtype_and_device_map,
-    extract_split_cache,
-    get_input_device,
-    prepare_readout_context,
-)
-from src.cli.run_csqa_logit_feature_response_curve_pipeline import (  # noqa: E402
     GOOD_REGION_LOG_RATIO_THRESHOLD,
     GRID_POINTS,
     KDE_BANDWIDTH_MULTIPLIER,
@@ -54,10 +48,14 @@ from src.cli.run_csqa_logit_feature_response_curve_pipeline import (  # noqa: E4
     build_distribution_models,
     build_feature_table,
     build_separation_summary,
+    choose_model_dtype_and_device_map,
+    extract_split_cache,
+    get_input_device,
+    prepare_readout_context,
+    resolve_hf_token,
     run_single_intervention_forward,
     select_top_k_layers_by_feature,
 )
-from src.cli.run_csqa_logit_feature_steering_pipeline import resolve_hf_token  # noqa: E402
 from src.csqa.common import get_decoder_layers  # noqa: E402
 from src.data.load_csqa import load_csqa  # noqa: E402
 
@@ -374,6 +372,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-split", type=str, default="train")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
+    parser.add_argument(
+        "--eval-top-up-from-fit-split",
+        action="store_true",
+        help="When fit/eval splits differ, fill missing eval examples up to --eval-limit using unused rows from the fit split.",
+    )
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
     parser.add_argument("--top-k-layers-per-feature", type=int, default=3)
@@ -424,15 +427,20 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--max-delta-over-hidden must be positive")
     backtrack_scales = parse_positive_scale_list(args.backtrack_scales)
     feature_names = parse_feature_names(args.feature_names)
-    fit_rows, eval_rows, same_source_split = load_fit_and_eval_rows(
+    fit_rows, eval_rows, same_source_split, split_plan = load_fit_and_eval_rows(
         fit_split=args.fit_split,
         eval_split=args.eval_split,
         fit_limit=fit_limit,
         eval_limit=eval_limit,
         seed=int(args.seed),
+        eval_top_up_from_fit_split=bool(args.eval_top_up_from_fit_split),
     )
     fit_split_tag = split_artifact_tag(args.fit_split, "fit", same_source_split)
-    eval_split_tag = split_artifact_tag(args.eval_split, "eval", same_source_split)
+    eval_split_tag = (
+        f"{args.eval_split}_plus_{args.fit_split}_topup"
+        if bool(split_plan["eval_top_up_from_fit_split"])
+        else split_artifact_tag(args.eval_split, "eval", same_source_split)
+    )
 
     print(
         "[config]",
@@ -447,6 +455,10 @@ def main(argv: list[str] | None = None) -> None:
                 "fit_limit": fit_limit,
                 "eval_limit": eval_limit,
                 "same_source_split_partition": same_source_split,
+                "fit_selection_strategy": split_plan["fit_selection_strategy"],
+                "eval_selection_strategy": split_plan["eval_selection_strategy"],
+                "eval_top_up_from_fit_split": bool(split_plan["eval_top_up_from_fit_split"]),
+                "eval_top_up_count": int(split_plan["eval_top_up_count"]),
                 "fit_n_examples": len(fit_rows),
                 "eval_n_examples": len(eval_rows),
                 "max_seq_len": args.max_seq_len,
@@ -626,6 +638,10 @@ def main(argv: list[str] | None = None) -> None:
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
         "same_source_split_partition": same_source_split,
+        "fit_selection_strategy": split_plan["fit_selection_strategy"],
+        "eval_selection_strategy": split_plan["eval_selection_strategy"],
+        "eval_top_up_from_fit_split": bool(split_plan["eval_top_up_from_fit_split"]),
+        "eval_top_up_count": int(split_plan["eval_top_up_count"]),
         "fit_n_examples": len(fit_rows),
         "eval_n_examples": len(eval_rows),
         "shared_split_partition_strategy": "deterministic_shuffle_then_disjoint_slice" if same_source_split else None,

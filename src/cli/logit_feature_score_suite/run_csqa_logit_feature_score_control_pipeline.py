@@ -29,10 +29,12 @@ from src.cli.logit_feature_score_suite.run_csqa_logit_feature_score_pipeline imp
     compute_score_ascent_unit_delta,
     evaluate_candidate_delta,
     interpolate_score_state,
+    load_fit_and_eval_rows,
     now_id,
     parse_feature_names,
     parse_positive_scale_list,
     select_score_ascent_delta,
+    split_artifact_tag,
     slugify_model_id,
 )
 from src.cli.run_csqa_adaptive_contrastive_pipeline import (  # noqa: E402
@@ -369,7 +371,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-seq-len", type=int, default=384)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--fit-split", type=str, default="train")
-    parser.add_argument("--eval-split", type=str, default="validation")
+    parser.add_argument("--eval-split", type=str, default="train")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--train-limit", type=int, default=None)
@@ -418,12 +420,19 @@ def main(argv: list[str] | None = None) -> None:
             )
         )
     )
-    if args.fit_split == args.eval_split:
-        raise ValueError("--fit-split and --eval-split must be different")
     if args.max_delta_over_hidden <= 0:
         raise ValueError("--max-delta-over-hidden must be positive")
     backtrack_scales = parse_positive_scale_list(args.backtrack_scales)
     feature_names = parse_feature_names(args.feature_names)
+    fit_rows, eval_rows, same_source_split = load_fit_and_eval_rows(
+        fit_split=args.fit_split,
+        eval_split=args.eval_split,
+        fit_limit=fit_limit,
+        eval_limit=eval_limit,
+        seed=int(args.seed),
+    )
+    fit_split_tag = split_artifact_tag(args.fit_split, "fit", same_source_split)
+    eval_split_tag = split_artifact_tag(args.eval_split, "eval", same_source_split)
 
     print(
         "[config]",
@@ -433,8 +442,13 @@ def main(argv: list[str] | None = None) -> None:
                 "model_id": args.model_id,
                 "fit_split": args.fit_split,
                 "eval_split": args.eval_split,
+                "fit_split_tag": fit_split_tag,
+                "eval_split_tag": eval_split_tag,
                 "fit_limit": fit_limit,
                 "eval_limit": eval_limit,
+                "same_source_split_partition": same_source_split,
+                "fit_n_examples": len(fit_rows),
+                "eval_n_examples": len(eval_rows),
                 "max_seq_len": args.max_seq_len,
                 "seed": args.seed,
                 "feature_names": feature_names,
@@ -451,9 +465,6 @@ def main(argv: list[str] | None = None) -> None:
             indent=2,
         ),
     )
-
-    fit_rows = load_csqa(split=args.fit_split, limit=fit_limit).copy()
-    eval_rows = load_csqa(split=args.eval_split, limit=eval_limit).copy()
     for frame in [fit_rows, eval_rows]:
         frame["prompt_len_chars"] = frame["text"].str.len()
 
@@ -498,7 +509,7 @@ def main(argv: list[str] | None = None) -> None:
 
     fit_cache = extract_split_cache(
         fit_rows,
-        split_name=args.fit_split,
+        split_name=fit_split_tag,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -513,7 +524,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     eval_cache = extract_split_cache(
         eval_rows,
-        split_name=args.eval_split,
+        split_name=eval_split_tag,
         tok=tok,
         model=model,
         input_device=input_device,
@@ -528,7 +539,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     fit_feature_df = build_feature_table(
-        split_name=args.fit_split,
+        split_name=fit_split_tag,
         cache=fit_cache,
         feature_names=feature_names,
         maybe_apply_final_norm=maybe_apply_final_norm,
@@ -539,7 +550,7 @@ def main(argv: list[str] | None = None) -> None:
         active_layer_numbers=candidate_layer_numbers,
     )
     eval_feature_df = build_feature_table(
-        split_name=args.eval_split,
+        split_name=eval_split_tag,
         cache=eval_cache,
         feature_names=feature_names,
         maybe_apply_final_norm=maybe_apply_final_norm,
@@ -582,26 +593,26 @@ def main(argv: list[str] | None = None) -> None:
         maybe_apply_final_norm=maybe_apply_final_norm,
         vocab_size=vocab_size,
         max_seq_len=args.max_seq_len,
-        eval_split_name=args.eval_split,
+        eval_split_name=eval_split_tag,
     )
 
     out_dir = resolve_out_dir(args.out_dir, args.model_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(fit_cache["example_rows"]).to_parquet(out_dir / f"{args.fit_split}_examples.parquet", index=False)
-    pd.DataFrame(eval_cache["example_rows"]).to_parquet(out_dir / f"{args.eval_split}_examples.parquet", index=False)
+    pd.DataFrame(fit_cache["example_rows"]).to_parquet(out_dir / f"{fit_split_tag}_examples.parquet", index=False)
+    pd.DataFrame(eval_cache["example_rows"]).to_parquet(out_dir / f"{eval_split_tag}_examples.parquet", index=False)
     pd.DataFrame(fit_cache["clean_output_rows"]).to_parquet(
-        out_dir / f"{args.fit_split}_clean_final_outputs.parquet", index=False
+        out_dir / f"{fit_split_tag}_clean_final_outputs.parquet", index=False
     )
     pd.DataFrame(eval_cache["clean_output_rows"]).to_parquet(
-        out_dir / f"{args.eval_split}_clean_final_outputs.parquet", index=False
+        out_dir / f"{eval_split_tag}_clean_final_outputs.parquet", index=False
     )
-    fit_feature_df.to_parquet(out_dir / f"{args.fit_split}_univariate_feature_values.parquet", index=False)
-    eval_feature_df.to_parquet(out_dir / f"{args.eval_split}_univariate_feature_values.parquet", index=False)
+    fit_feature_df.to_parquet(out_dir / f"{fit_split_tag}_univariate_feature_values.parquet", index=False)
+    eval_feature_df.to_parquet(out_dir / f"{eval_split_tag}_univariate_feature_values.parquet", index=False)
     separation_df.to_parquet(out_dir / "feature_layer_separation_summary.parquet", index=False)
     selected_layers_df.to_parquet(out_dir / "selected_layers_by_feature.parquet", index=False)
     distribution_grid_df.to_parquet(out_dir / "fit_distribution_grid.parquet", index=False)
-    policy_outputs_df.to_parquet(out_dir / f"{args.eval_split}_score_control_policy_outputs_raw.parquet", index=False)
+    policy_outputs_df.to_parquet(out_dir / f"{eval_split_tag}_score_control_policy_outputs_raw.parquet", index=False)
 
     run_config = {
         "dataset": "csqa",
@@ -610,8 +621,14 @@ def main(argv: list[str] | None = None) -> None:
         "max_seq_len": int(args.max_seq_len),
         "fit_split": args.fit_split,
         "eval_split": args.eval_split,
+        "fit_split_tag": fit_split_tag,
+        "eval_split_tag": eval_split_tag,
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
+        "same_source_split_partition": same_source_split,
+        "fit_n_examples": len(fit_rows),
+        "eval_n_examples": len(eval_rows),
+        "shared_split_partition_strategy": "deterministic_shuffle_then_disjoint_slice" if same_source_split else None,
         "method": "logit_feature_score_control",
         "intervention_types": list(CONTROL_INTERVENTION_TYPES),
         "feature_names": feature_names,

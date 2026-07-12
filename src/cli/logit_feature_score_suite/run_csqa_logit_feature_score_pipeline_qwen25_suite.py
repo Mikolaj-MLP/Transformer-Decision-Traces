@@ -14,7 +14,7 @@ from src.csqa.model_presets import resolve_qwen25_instruct_model_id
 
 DEFAULT_SIZES = ["0.5B", "3B", "7B"]
 DEFAULT_FIT_LIMIT = "2000"
-DEFAULT_EVAL_LIMIT = None
+DEFAULT_EVAL_LIMIT = "2000"
 DEFAULT_TOP_K = "7"
 DEFAULT_MAX_DELTA_OVER_HIDDEN = "0.005"
 DEFAULT_FEATURE_NAMES = "answer_choice_top1_top2_logit_gap,answer_choice_varentropy"

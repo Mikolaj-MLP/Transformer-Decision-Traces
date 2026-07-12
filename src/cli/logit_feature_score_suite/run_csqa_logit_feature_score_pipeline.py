@@ -18,14 +18,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.cli.run_csqa_adaptive_contrastive_pipeline import (  # noqa: E402
+from src.cli.logit_feature_score_suite.common import (  # noqa: E402
     EXTRACT_BATCH_SIZE,
-    choose_model_dtype_and_device_map,
-    extract_split_cache,
-    get_input_device,
-    prepare_readout_context,
-)
-from src.cli.run_csqa_logit_feature_response_curve_pipeline import (  # noqa: E402
     GOOD_REGION_LOG_RATIO_THRESHOLD,
     GRID_POINTS,
     KDE_BANDWIDTH_MULTIPLIER,
@@ -35,12 +29,16 @@ from src.cli.run_csqa_logit_feature_response_curve_pipeline import (  # noqa: E4
     build_distribution_models,
     build_feature_table,
     build_separation_summary,
+    choose_model_dtype_and_device_map,
     compute_feature_from_token_hidden,
+    extract_split_cache,
+    get_input_device,
     parse_float_list,
+    prepare_readout_context,
+    resolve_hf_token,
     run_single_intervention_forward,
     select_top_k_layers_by_feature,
 )
-from src.cli.run_csqa_logit_feature_steering_pipeline import resolve_hf_token  # noqa: E402
 from src.csqa.common import encode_prompts, get_decoder_layers  # noqa: E402
 from src.data.load_csqa import load_csqa  # noqa: E402
 
@@ -96,30 +94,67 @@ def load_fit_and_eval_rows(
     fit_limit: int | None,
     eval_limit: int | None,
     seed: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    eval_top_up_from_fit_split: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool, dict[str, object]]:
     same_source_split = fit_split == eval_split
-    if not same_source_split:
+    if same_source_split:
+        needed = None if (fit_limit is None or eval_limit is None) else int(fit_limit) + int(eval_limit)
+        source_rows = load_csqa(split=fit_split, limit=needed).copy()
+        source_rows = source_rows.sample(frac=1.0, random_state=int(seed)).reset_index(drop=True)
+
+        fit_stop = len(source_rows) if fit_limit is None else min(int(fit_limit), len(source_rows))
+        eval_start = fit_stop
+        eval_stop = len(source_rows) if eval_limit is None else min(eval_start + int(eval_limit), len(source_rows))
+        fit_rows = source_rows.iloc[:fit_stop].copy().reset_index(drop=True)
+        eval_rows = source_rows.iloc[eval_start:eval_stop].copy().reset_index(drop=True)
+
+        if fit_rows.empty:
+            raise ValueError("Empty fit split after partitioning the shared source split")
+        if eval_rows.empty:
+            raise ValueError(
+                "Empty eval split after partitioning the shared source split; reduce --fit-limit or --eval-limit"
+            )
+        return fit_rows, eval_rows, True, {
+            "fit_selection_strategy": "deterministic_shuffle_then_disjoint_slice",
+            "eval_selection_strategy": "deterministic_shuffle_then_disjoint_slice",
+            "eval_top_up_from_fit_split": False,
+            "eval_top_up_count": 0,
+        }
+
+    if not eval_top_up_from_fit_split:
         fit_rows = load_csqa(split=fit_split, limit=fit_limit).copy()
         eval_rows = load_csqa(split=eval_split, limit=eval_limit).copy()
-        return fit_rows.reset_index(drop=True), eval_rows.reset_index(drop=True), False
+        return fit_rows.reset_index(drop=True), eval_rows.reset_index(drop=True), False, {
+            "fit_selection_strategy": "direct_split_load",
+            "eval_selection_strategy": "direct_split_load",
+            "eval_top_up_from_fit_split": False,
+            "eval_top_up_count": 0,
+        }
 
-    needed = None if (fit_limit is None or eval_limit is None) else int(fit_limit) + int(eval_limit)
-    source_rows = load_csqa(split=fit_split, limit=needed).copy()
-    source_rows = source_rows.sample(frac=1.0, random_state=int(seed)).reset_index(drop=True)
+    fit_source_rows = load_csqa(split=fit_split, limit=None).copy()
+    fit_source_rows = fit_source_rows.sample(frac=1.0, random_state=int(seed)).reset_index(drop=True)
+    fit_stop = len(fit_source_rows) if fit_limit is None else min(int(fit_limit), len(fit_source_rows))
+    fit_rows = fit_source_rows.iloc[:fit_stop].copy().reset_index(drop=True)
+    fit_source_remaining = fit_source_rows.iloc[fit_stop:].copy().reset_index(drop=True)
 
-    fit_stop = len(source_rows) if fit_limit is None else min(int(fit_limit), len(source_rows))
-    eval_start = fit_stop
-    eval_stop = len(source_rows) if eval_limit is None else min(eval_start + int(eval_limit), len(source_rows))
-    fit_rows = source_rows.iloc[:fit_stop].copy().reset_index(drop=True)
-    eval_rows = source_rows.iloc[eval_start:eval_stop].copy().reset_index(drop=True)
+    eval_rows = load_csqa(split=eval_split, limit=eval_limit).copy().reset_index(drop=True)
+    eval_top_up_count = 0
+    if eval_limit is not None and len(eval_rows) < int(eval_limit):
+        deficit = int(eval_limit) - len(eval_rows)
+        top_up_rows = fit_source_remaining.iloc[:deficit].copy().reset_index(drop=True)
+        eval_top_up_count = len(top_up_rows)
+        eval_rows = pd.concat([eval_rows, top_up_rows], ignore_index=True)
 
     if fit_rows.empty:
-        raise ValueError("Empty fit split after partitioning the shared source split")
+        raise ValueError("Empty fit split after partitioning the fit split")
     if eval_rows.empty:
-        raise ValueError(
-            "Empty eval split after partitioning the shared source split; reduce --fit-limit or --eval-limit"
-        )
-    return fit_rows, eval_rows, True
+        raise ValueError("Empty eval split after composing eval rows")
+    return fit_rows, eval_rows, False, {
+        "fit_selection_strategy": "deterministic_shuffle_then_prefix",
+        "eval_selection_strategy": "base_eval_plus_unused_fit_topup",
+        "eval_top_up_from_fit_split": True,
+        "eval_top_up_count": int(eval_top_up_count),
+    }
 
 
 def parse_positive_scale_list(raw: str) -> list[float]:
@@ -588,6 +623,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--eval-split", type=str, default="train")
     parser.add_argument("--fit-limit", type=int, default=None)
     parser.add_argument("--eval-limit", type=int, default=None)
+    parser.add_argument(
+        "--eval-top-up-from-fit-split",
+        action="store_true",
+        help="When fit/eval splits differ, fill missing eval examples up to --eval-limit using unused rows from the fit split.",
+    )
     parser.add_argument("--train-limit", type=int, default=None)
     parser.add_argument("--validation-limit", type=int, default=None)
     parser.add_argument("--top-k-layers-per-feature", type=int, default=3)
@@ -638,15 +678,20 @@ def main(argv: list[str] | None = None) -> None:
         raise ValueError("--max-delta-over-hidden must be positive")
     backtrack_scales = parse_positive_scale_list(args.backtrack_scales)
     feature_names = parse_feature_names(args.feature_names)
-    fit_rows, eval_rows, same_source_split = load_fit_and_eval_rows(
+    fit_rows, eval_rows, same_source_split, split_plan = load_fit_and_eval_rows(
         fit_split=args.fit_split,
         eval_split=args.eval_split,
         fit_limit=fit_limit,
         eval_limit=eval_limit,
         seed=int(args.seed),
+        eval_top_up_from_fit_split=bool(args.eval_top_up_from_fit_split),
     )
     fit_split_tag = split_artifact_tag(args.fit_split, "fit", same_source_split)
-    eval_split_tag = split_artifact_tag(args.eval_split, "eval", same_source_split)
+    eval_split_tag = (
+        f"{args.eval_split}_plus_{args.fit_split}_topup"
+        if bool(split_plan["eval_top_up_from_fit_split"])
+        else split_artifact_tag(args.eval_split, "eval", same_source_split)
+    )
 
     print(
         "[config]",
@@ -661,6 +706,10 @@ def main(argv: list[str] | None = None) -> None:
                 "fit_limit": fit_limit,
                 "eval_limit": eval_limit,
                 "same_source_split_partition": same_source_split,
+                "fit_selection_strategy": split_plan["fit_selection_strategy"],
+                "eval_selection_strategy": split_plan["eval_selection_strategy"],
+                "eval_top_up_from_fit_split": bool(split_plan["eval_top_up_from_fit_split"]),
+                "eval_top_up_count": int(split_plan["eval_top_up_count"]),
                 "fit_n_examples": len(fit_rows),
                 "eval_n_examples": len(eval_rows),
                 "max_seq_len": args.max_seq_len,
@@ -839,6 +888,10 @@ def main(argv: list[str] | None = None) -> None:
         "fit_limit": fit_limit,
         "eval_limit": eval_limit,
         "same_source_split_partition": same_source_split,
+        "fit_selection_strategy": split_plan["fit_selection_strategy"],
+        "eval_selection_strategy": split_plan["eval_selection_strategy"],
+        "eval_top_up_from_fit_split": bool(split_plan["eval_top_up_from_fit_split"]),
+        "eval_top_up_count": int(split_plan["eval_top_up_count"]),
         "fit_n_examples": len(fit_rows),
         "eval_n_examples": len(eval_rows),
         "shared_split_partition_strategy": "deterministic_shuffle_then_disjoint_slice" if same_source_split else None,

@@ -1,18 +1,28 @@
-﻿# Current CLI Surface
+# Pipeline'y końcowego eksperymentu
 
-Active scripts in this directory:
+Pliki `run_*.py` są cienkimi entrypointami. Parsują argumenty i przekazują sterowanie do kodu wykonawczego; nie zawierają definicji matematycznych.
 
-- `extract_csqa_trace_feature_tables.py`
-  - one-shot raw trace-feature extraction for `csqa`
-- `run_csqa_logit_feature_steering_pipeline.py`
-  - end-to-end univariate logit-feature detector + feature-targeted intervention pipeline for `csqa`
-- `run_csqa_adaptive_contrastive_pipeline.py`
-  - end-to-end detector + adaptive contrastive intervention pipeline
-- `run_csqa_logit_feature_steering_pipeline_qwen25_suite.py`
-  - no-arg Qwen2.5 CSQA suite (`0.5B,3B,7B`)
-- `run_csqa_logit_feature_steering_pipeline_llama32_suite.py`
-  - no-arg Llama 3.2 CSQA suite (`1B,3B`)
-- `run_csqa_tuned_lens_gap_steering_oneoff.py`
-  - one-off CSQA experiment: tuned-lens readout, single feature (`top1-top2 logit gap`), same detector/control pipeline
+Najważniejsze entrypointy:
 
-Older exploratory and generic extraction CLIs were moved to `src/legacy/cli/`.
+- `logit_feature_score_suite/run_csqa_logit_feature_diagnostics_pipeline.py`
+  - diagnostyka cech logitowych i przebiegu śladu decyzyjnego dla pojedynczego modelu
+- `logit_feature_score_suite/run_csqa_logit_feature_diagnostics_suite.py`
+  - diagnostyka rodzin Qwen 2.5 i Llama 3.2
+- `logit_feature_score_suite/run_csqa_logit_feature_score_control_pipeline.py`
+  - pełny eksperyment interwencyjny dla pojedynczego modelu: `ascent`, `descent`, `random_same_norm`
+- `logit_feature_score_suite/run_csqa_logit_feature_score_control_cap_sweep.py`
+  - wspólny runner dla rodzin Qwen i Llama oraz wielu wartości capa
+
+Podział odpowiedzialności:
+
+- `src/score/` — cechy, KS, KDE, funkcja `score` i matematyka perturbacji;
+- `logit_feature_score_suite/experiment_core.py` — wspólna sekwencja ekstrakcji i dopasowania;
+- `logit_feature_score_suite/model_runtime.py` — obsługa modelu, readoutów i hooka;
+- `logit_feature_score_suite/score_policy.py` — pętla wariantu ascent;
+- `logit_feature_score_suite/control_policy.py` — pętla ascent/descent/random;
+- `logit_feature_score_suite/intervention_experiment.py` — orkiestracja i zapis wyników;
+- `logit_feature_score_suite/diagnostics_experiment.py` — orkiestracja diagnostyki.
+
+Najkrótszą ścieżką do zrozumienia metody jest [opis warstwy badawczej](../score/README.md), a nie kod CLI.
+
+Analizy zapisanych wyników znajdują się w katalogu `scripts/`; wszystkie dotyczą końcowego wariantu score. Skrypty generujące notebooki oraz pipeline'y wcześniejszych metod zostały usunięte.

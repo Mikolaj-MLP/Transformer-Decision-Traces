@@ -2,8 +2,6 @@ numpy==1.26.4
 pandas==2.2.2
 pyarrow==16.1.0
 datasets==2.19.1
-requests==2.32.3
-conllu==4.5.3
 tqdm==4.66.4
 
 torch>=2.2.2
@@ -11,18 +9,9 @@ transformers>=4.40.1
 tokenizers>=0.19.1
 accelerate>=0.27.2
 scikit-learn>=1.4.2
-evaluate>=0.4.1
-
-einops>=0.7.0
-zarr>=2.17.0
-numcodecs>=0.12.1
-zstandard>=0.22.0
-
+scipy>=1.12.0
 matplotlib>=3.9.0
-rich>=13.7.0
-pyyaml>=6.0.1
+seaborn>=0.13.2
 
 jupyterlab>=4.1.5
 ipykernel>=6.29.3
-
-zarr

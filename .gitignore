@@ -40,25 +40,25 @@ htmlcov/
 .huggingface/
 .cache/
 
-# Project data & artifacts 
-!data/.gitkeep
+# Project data & artifacts
+data/
 
 models/hf_cache/
 models/checkpoints/
-tools/
 traces/
-!traces/.gitkeep
 
 experiments/runs/
-!experiments/.gitkeep
 
 results/
-!results/.gitkeep
 
 logs/
 wandb/
 mlruns/
 outputs/
+
+# Generated analysis exports
+docs/figures/
+docs/*_analysis/
 
 # ML stuff
 *.pt
@@ -75,7 +75,5 @@ outputs/
 *.safetensors
 *.joblib
 *.pth
-
-
 
 Notes_for_me.txt

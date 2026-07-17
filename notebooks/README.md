@@ -1,13 +1,11 @@
-# Notebooks
+# Notebooki końcowego eksperymentu
 
-## static
-Static and layerwise descriptive analyses.
+Repozytorium zawiera wyłącznie notebooki dotyczące diagnostyki cech logitowych i interwencji opartej na funkcji `score`:
 
-## intervention
-Noising, patching, steering, and intervention-outcome analyses.
+- `intervention/score_suite/inspect_score_diagnostics_runs.ipynb` — diagnostyka przebiegu cech, ich rozkładów oraz funkcji `score`;
+- `intervention/score_suite/inspect_score_intervention_runs.ipynb` — główne porównania wyników interwencji i kontroli;
+- `intervention/score_suite/inspect_score_intervention_layers.ipynb` — zależność efektów od warstwy i jej względnej głębokości.
 
-## predictor
-Error-prediction and intervention-gating analyses.
+Notebooki zawierają wyłącznie agregacje i wykresy odpowiadające pytaniom badawczym. Wspólne wczytywanie oraz porządkowanie eksportów znajduje się w `src/analysis`, dzięki czemu ta sama kilkusetwierszowa komórka nie jest powielana w każdym notebooku.
 
-## legacy
-Archived or older exploratory notebooks kept for reference.
+Eksporty są wyszukiwane w katalogu danych obok repozytorium albo w ścieżce wskazanej zmienną `TRANSFORMER_DECISION_TRACES_DATA`.
